@@ -169,8 +169,21 @@ class IssuerManifest:
     def from_dict(obj: dict[str, Any]) -> "IssuerManifest":
         if obj.get("protocol") != PROTOCOL:
             raise TransparencyError("unsupported issuer transparency protocol")
-        if int(obj.get("version", 0)) not in SUPPORTED_VERSIONS:
+        raw_version = obj.get("version", 0)
+        if (
+            isinstance(raw_version, bool)
+            or not isinstance(raw_version, int)
+            or raw_version not in SUPPORTED_VERSIONS
+        ):
             raise TransparencyError("unsupported issuer transparency version")
+        # This manifest version understands no critical extensions. A non-empty
+        # declaration must fail closed rather than being silently ignored.
+        critical_extensions = obj.get("criticalExtensions")
+        if critical_extensions is not None:
+            if not isinstance(critical_extensions, list) or critical_extensions:
+                raise TransparencyError(
+                    "unsupported critical extension in issuer manifest"
+                )
         keys = [IssuerKey.from_dict(k) for k in obj.get("activeKeys", [])]
         return IssuerManifest(
             organization_identity_hash=_require_hex(
@@ -201,6 +214,22 @@ class IssuerManifest:
         )
 
 
+def _validate_manifest_keys(active_keys: list[IssuerKey]) -> None:
+    """Reject manifests with repeated key identifiers or conflicting key attributes."""
+    seen: dict[str, IssuerKey] = {}
+    for key in active_keys:
+        if not key.key_id:
+            raise TransparencyError("keyId is required")
+        existing = seen.get(key.key_id)
+        if existing is not None:
+            if existing != key:
+                raise TransparencyError(
+                    f"conflicting attributes for repeated keyId: {key.key_id}"
+                )
+            raise TransparencyError(f"duplicate keyId in manifest: {key.key_id}")
+        seen[key.key_id] = key
+
+
 def canonicalize_manifest(manifest: IssuerManifest) -> str:
     """Deterministic JSON encoding used for hashing and signatures."""
     payload = manifest.to_dict()
@@ -213,6 +242,7 @@ def canonicalize_manifest(manifest: IssuerManifest) -> str:
         raise TransparencyError("active key count exceeds bound")
     if not manifest.issuer_address:
         raise TransparencyError("issuerAddress is required")
+    _validate_manifest_keys(manifest.active_keys)
     return encoded.decode("utf-8")
 
 
