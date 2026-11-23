@@ -319,3 +319,23 @@ def _blob_gc_enabled_env() -> bool:
             return val.strip().lower() in {"1", "true", "yes", "on"}
     return False
 
+
+UPLOAD_SESSION_TTL_SECONDS_DEFAULT = 3600
+
+
+def _upload_session_ttl_env(
+    name: str = "UPLOAD_SESSION_TTL_SECONDS",
+    default: int = UPLOAD_SESSION_TTL_SECONDS_DEFAULT,
+) -> int:
+    """Load UPLOAD_SESSION_TTL_SECONDS (or HARPOCRATES_UPLOAD_SESSION_TTL_SECONDS)."""
+    raw = os.getenv(name) or os.getenv("HARPOCRATES_UPLOAD_SESSION_TTL_SECONDS")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} must be non-negative")
+    return parsed
+

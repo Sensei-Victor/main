@@ -641,6 +641,7 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | Vault automatically locks after 15 minutes of inactivity | `credentialVault.ts` → `resetTimeout` |
 | Explicit zeroization when locking or destroying the vault | `credentialVault.ts` → `lock`, `destroy` |
 | Only the encrypted envelope is persisted, not plaintext seeds | `safeStorage.ts` |
+| Cross-tab vault modification detection invalidates stale unlocked sessions and preserves active witness material until explicit recovery | `credentialVault.ts` → `isStale`, `recover`, `safeStorage.ts` → `addCrossTabStorageListener` |
 
 **Residual risk:** Memory scraping by highly privileged malware or malicious browser extensions could potentially read the derived `CryptoKey` or decrypted seeds while the vault is temporarily unlocked. XSS could invoke the vault's unlock method if the password was somehow intercepted (e.g. keylogger).
 

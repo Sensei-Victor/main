@@ -88,12 +88,35 @@ except ImportError:
     default_min_confirmations = None
     reconcile_pending_registrations = None
     reconcile_registration = None
-from idempotency import (
-    IntentConflictError,
-    idempotent,
-    persist_registration_intent,
-    registration_intent_digest,
-)
+
+try:
+    from registration_quarantine import record_registration_conflict
+except ImportError:
+    record_registration_conflict = None  # type: ignore[assignment]
+
+
+def build_reconcile_batch_report(
+    *,
+    limit: int,
+    selected: int,
+    processed: int,
+    deferred: int,
+) -> dict:
+    """Describe a reconciliation batch for administrative responses.
+
+    ``complete_batch`` is true when every selected item in this batch was
+    processed.  ``complete_backlog`` is true only when nothing was deferred,
+    meaning no further pending work remains beyond this batch.
+    """
+    return {
+        "limit": int(limit),
+        "selected": int(selected),
+        "processed": int(processed),
+        "deferred": int(deferred),
+        "complete_batch": int(processed) == int(selected),
+        "complete_backlog": int(deferred) == 0 and int(processed) == int(selected),
+    }
+from idempotency import idempotent
 from lineage import (
     LineageValidationError,
     canonical_lineage_manifest,
@@ -117,13 +140,8 @@ from metadata_errors import (
     metadata_error_response,
 )
 from schema import discover_schemas, resolve_schema, validate_selective_disclosure_input
-from verification_receipt import build_verification_receipt, signing_key_history
-from stego import canonical_metadata_hash, embed_metadata, extract_metadata, sha256_file
-try:
-    from stego import StegoLimitExceededError
-except (ImportError, AttributeError):
-    class StegoLimitExceededError(RuntimeError):  # type: ignore[no-redef]
-        pass
+from verification_receipt import build_verification_receipt
+from stego import StegoLimitExceededError, canonical_metadata_hash, embed_metadata, extract_metadata, sha256_file
 from capture_attestation import (
     build_assurance_schema,
     canonical_attestation_hash,
@@ -140,6 +158,7 @@ from c2pa import (
 )
 from logging_utils import log_structured, redact_sensitive
 from errors import (
+    GONE,
     INTERNAL_ERROR,
     NOT_FOUND,
     PAYLOAD_TOO_LARGE,
@@ -175,10 +194,15 @@ from streaming_upload import (
     ResumableUploadSessionStore,
     SessionNotFoundError,
     StreamingFileStorage,
-    UploadSessionError,
+    UploadCancelledError,
+    UploadSessionRegistry,
+    UploadState,
     create_streaming_file_storage,
+    get_session_dir,
     hash_paths_concat,
-    resolve_temp_dir,
+    init_session_dir,
+    is_session_expired,
+    touch_session,
 )
 from werkzeug.datastructures import ImmutableMultiDict
 
@@ -458,12 +482,14 @@ def create_app() -> Flask:
         timeout_seconds=config.admission_timeout_seconds,
         max_temp_storage_per_identity=config.upload_temp_budget_bytes,
     )
+    upload_session_registry = UploadSessionRegistry()
 
     upload_session_store = ResumableUploadSessionStore(
         base_dir=resolve_temp_dir(getattr(config, "upload_temp_dir", None)) or tempfile.gettempdir(),
         default_chunk_size=getattr(config, "upload_chunk_bytes", None),
         default_max_size=getattr(config, "upload_max_bytes", None) if getattr(config, "upload_max_bytes", None) is not None else config.max_video_bytes,
     )
+    upload_session_registry = UploadSessionRegistry()
 
     @app.before_request
     def start_request_context():
@@ -1046,143 +1072,45 @@ def create_app() -> Flask:
     @app.post("/api/stego/upload-session")
     @limiter.limit(config.ratelimit_upload_session)
     def create_upload_session():
-        payload = request.get_json(silent=True) or {}
-        if not isinstance(payload, dict):
-            return error_response(
-                code=VALIDATION_ERROR,
-                message="upload session payload must be a JSON object",
-                status=400,
-            )
-        owner = payload.get("owner") or request.headers.get("X-Upload-Owner")
-        owner_tier = payload.get("ownerTier") or request.headers.get("X-Upload-Owner-Tier")
-        expected_sha256 = payload.get("expectedSha256") or request.headers.get("X-Expected-Sha256")
-        expected_size = payload.get("expectedSize")
-        try:
-            session, session_token = upload_session_store.create_session(
-                owner=owner,
-                owner_tier=owner_tier,
-                expected_sha256=expected_sha256,
-                expected_size=expected_size,
-            )
-        except RequestEntityTooLarge:
-            return error_response(
-                code=PAYLOAD_TOO_LARGE,
-                message="upload exceeds size limit",
-                status=413,
-            )
-        except UploadSessionError as exc:
-            return error_response(code=exc.code, message=str(exc), status=exc.status_code)
-
-        body = {
-            "sessionId": session.session_id,
-            "encrypted": True,
-        }
-        if session.owner is not None:
-            body["owner"] = session.owner
-        if session.owner_tier is not None:
-            body["ownerTier"] = session.owner_tier
-        if session_token is not None:
-            body["sessionToken"] = session_token
-        if session.expected_sha256 is not None:
-            body["expectedSha256"] = session.expected_sha256
-        if session.expected_size is not None:
-            body["expectedSize"] = session.expected_size
-        return jsonify(body)
-
-    @app.get("/api/stego/upload-session/<session_id>")
-    @limiter.limit(config.ratelimit_upload_session)
-    def get_upload_session(session_id: str):
-        session_token, owner = _extract_upload_session_auth()
-        try:
-            progress = upload_session_store.get_progress(
-                session_id,
-                session_token=session_token,
-                owner=owner,
-            )
-        except UploadSessionError as exc:
-            return error_response(code=exc.code, message=str(exc), status=exc.status_code)
-        return jsonify(progress)
+        session_id = str(uuid.uuid4())
+        session_dir = Path(tempfile.gettempdir()) / f"harpocrates-session-{session_id}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session = upload_session_registry.create(session_id, session_dir)
+        ticket = admission_controller.create_ticket(session_id)
+        session.attach_queued_admission(ticket.id if ticket is not None else None)
+        return jsonify({"sessionId": session_id})
 
     @app.put("/api/stego/upload-session/<session_id>/chunk/<int:chunk_index>")
     @limiter.limit(config.ratelimit_upload_chunk)
+    @require_capacity(admission_controller)
     def upload_chunk(session_id: str, chunk_index: int):
+        session = upload_session_registry.get(session_id)
+        if session is None:
+            return jsonify({"error": "session not found"}), 404
+        session_dir = session.session_dir
+        if not session_dir.exists():
+            return jsonify({"error": "session not found"}), 404
+
         chunk = request.files.get("chunk")
         if chunk is None:
             return jsonify({"error": "chunk is required"}), 400
         if chunk_index < 0:
             return jsonify({"error": "chunk_index must be non-negative"}), 400
 
-        # Handle declared size consistency check
-        declared_size_header = request.headers.get("X-Declared-Size")
-        metadata_path = session_dir / "session.json"
-        
-        if declared_size_header is not None:
-            try:
-                declared_size = int(declared_size_header)
-                if declared_size < 0:
-                    return jsonify({"error": "X-Declared-Size must be non-negative"}), 400
-            except ValueError:
-                return jsonify({"error": "X-Declared-Size must be an integer"}), 400
-            
-            if metadata_path.exists():
-                # Session metadata exists, validate declared size matches
-                try:
-                    with metadata_path.open("r") as f:
-                        session_meta = json.load(f)
-                    stored_declared = session_meta.get("declared_size")
-                    if stored_declared is not None and stored_declared != declared_size:
-                        return jsonify({
-                            "error": "declared size mismatch",
-                            "expected": stored_declared,
-                            "received": declared_size
-                        }), 400
-                except (json.JSONDecodeError, OSError):
-                    # If metadata is corrupted, treat as no declared size
-                    pass
-            else:
-                # First chunk with declared size - store it
-                session_meta = {"declared_size": declared_size, "total_uploaded": 0}
-                try:
-                    with metadata_path.open("w") as f:
-                        json.dump(session_meta, f)
-                except OSError:
-                    pass  # Non-critical, continue without tracking
+        admission_ticket = getattr(g, "admission_ticket", None)
+        if admission_ticket is not None:
+            session.attach_admission(admission_ticket.id)
 
-        # Persist each session chunk with bounded-chunk hashing for integrity.
         g.upload_config = config
-        streaming_chunk = create_streaming_file_storage(chunk)
+        streaming_chunk = create_streaming_file_storage(chunk, cancellation=session)
         chunk_path = session_dir / f"chunk-{chunk_index}"
         try:
-            progress, total_bytes = upload_session_store.write_chunk(
-                session_id,
-                chunk_index,
-                chunk.stream,
-                session_token=session_token,
-                owner=owner,
-                chunk_sha256=chunk_sha256,
-            )
+            with session.writer():
+                streaming_chunk.save(str(chunk_path))
+        except UploadCancelledError as exc:
+            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
         except RequestEntityTooLarge:
             return jsonify({"error": "chunk exceeds size limit"}), 413
-
-        # Update total uploaded bytes if tracking
-        if metadata_path.exists():
-            try:
-                with metadata_path.open("r") as f:
-                    session_meta = json.load(f)
-                session_meta["total_uploaded"] = session_meta.get("total_uploaded", 0) + streaming_chunk.bytes_written
-                # Check if total exceeds declared size
-                declared = session_meta.get("declared_size")
-                if declared is not None and session_meta["total_uploaded"] > declared:
-                    return jsonify({
-                        "error": "total uploaded bytes exceeds declared size",
-                        "declared": declared,
-                        "uploaded": session_meta["total_uploaded"]
-                    }), 400
-                with metadata_path.open("w") as f:
-                    json.dump(session_meta, f)
-            except (json.JSONDecodeError, OSError):
-                pass  # Non-critical
-
         return jsonify({
             "ok": True,
             "chunkIndex": progress.index,
@@ -1192,44 +1120,43 @@ def create_app() -> Flask:
             "encrypted": True,
         })
 
+    @app.post("/api/stego/upload-session/<session_id>/cancel")
+    @limiter.limit(config.ratelimit_upload_session)
+    def cancel_upload_session(session_id: str):
+        cancelled = upload_session_registry.cancel(session_id, admission_controller)
+        if cancelled is None:
+            return jsonify({"error": "session not found"}), 404
+        if not cancelled:
+            return jsonify({
+                "error": "session cannot be cancelled",
+                "code": "UPLOAD_NOT_CANCELLABLE",
+            }), 409
+        return jsonify({"ok": True, "state": UploadState.CANCELLED.value})
+
     @app.post("/api/stego/upload-session/<session_id>/commit")
     @limiter.limit(config.ratelimit_upload_session)
     def commit_upload_session(session_id: str):
-        session_token, owner = _extract_upload_session_auth()
-        expected_sha256 = (
-            request.form.get("expectedSha256")
-            or request.headers.get("X-Expected-Sha256")
-            or None
-        )
-
-        # Authenticate session before parsing metadata or admitting processing work.
-        try:
-            session = upload_session_store.authenticate_session(
-                session_id,
-                session_token=session_token,
-                owner=owner,
-            )
-        except SessionNotFoundError:
+        session = upload_session_registry.get(session_id)
+        if session is None:
             return jsonify({"error": "session not found"}), 404
-        except UploadSessionError as exc:
-            return error_response(code=exc.code, message=str(exc), status=exc.status_code)
+        session_dir = session.session_dir
+        if not session_dir.exists():
+            return jsonify({"error": "session not found"}), 404
+        if is_session_expired(session_dir, ttl_seconds=config.upload_session_ttl_seconds):
+            return error_response(
+                code=GONE,
+                message="upload session has expired",
+                status=410,
+            )
 
-        # Validate declared size consistency at commit time
-        metadata_path = session_dir / "session.json"
-        if metadata_path.exists():
-            try:
-                with metadata_path.open("r") as f:
-                    session_meta = json.load(f)
-                declared = session_meta.get("declared_size")
-                total_uploaded = session_meta.get("total_uploaded", 0)
-                if declared is not None and total_uploaded != declared:
-                    return jsonify({
-                        "error": "total uploaded bytes does not match declared size",
-                        "declared": declared,
-                        "uploaded": total_uploaded
-                    }), 400
-            except (json.JSONDecodeError, OSError):
-                pass  # Non-critical
+        admission_ticket = getattr(g, "admission_ticket", None)
+        if admission_ticket is not None:
+            session.attach_admission(admission_ticket.id)
+        session.mark_committing()
+        try:
+            session.check_cancelled()
+        except UploadCancelledError as exc:
+            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
 
         metadata_raw = request.form.get("metadata")
         if metadata_raw is None:
@@ -1248,26 +1175,39 @@ def create_app() -> Flask:
         except ValueError as exc:
             return metadata_error_response(classify_validation_error(exc))
 
-        with tempfile.TemporaryDirectory(prefix="harpocrates-") as tmp_dir:
-            combined_path = Path(tmp_dir) / "combined.video"
-            # Decrypt, assemble, and verify the final content hash BEFORE
-            # acquiring an admission slot for processing work.
-            try:
-                session, source_hash, _written = upload_session_store.assemble_and_verify(
-                    session_id,
+        combined_path = session_dir / "combined.video"
+        chunk_files = sorted(
+            [f for f in session_dir.iterdir() if f.name.startswith("chunk-")],
+            key=lambda f: int(f.name.split("-")[1]),
+        )
+        if not chunk_files:
+            return jsonify({"error": "session has no chunks"}), 400
+
+        # Bounded-chunk concat + SHA-256 so commit never buffers whole chunks.
+        try:
+            with session.writer():
+                source_hash, _written = hash_paths_concat(
+                    chunk_files,
                     combined_path,
-                    session_token=session_token,
-                    owner=owner,
-                    expected_sha256=expected_sha256,
+                    chunk_size=getattr(config, "upload_chunk_bytes", None),
+                    max_size=getattr(config, "upload_max_bytes", config.max_video_bytes),
+                    cancellation=session,
                 )
-            except RequestEntityTooLarge:
-                return error_response(
-                    code=PAYLOAD_TOO_LARGE,
-                    message="upload exceeds size limit",
-                    status=413,
+        except UploadCancelledError as exc:
+            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
+
+        # Sniff assembled file before handing it to ffmpeg.
+        try:
+            with session.writer():
+                source_hash, _written = hash_paths_concat(
+                    chunk_files,
+                    combined_path,
+                    chunk_size=getattr(config, "upload_chunk_bytes", None),
+                    max_size=getattr(config, "upload_max_bytes", config.max_video_bytes),
+                    cancellation=session,
                 )
-            except UploadSessionError as exc:
-                return error_response(code=exc.code, message=str(exc), status=exc.status_code)
+        except UploadCancelledError as exc:
+            return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
 
             # Sniff assembled file before handing it to ffmpeg.
             try:
@@ -1337,7 +1277,11 @@ def create_app() -> Flask:
                 json.dumps(metadata, separators=(",", ":"), sort_keys=True).encode("utf-8")
             ).decode("ascii")
 
-        upload_session_store.cleanup_session(session_id)
+        if session.queued_admission_ticket_id:
+            admission_controller.release_ticket(session.queued_admission_ticket_id)
+        session.complete()
+        upload_session_registry.remove(session_id)
+        shutil.rmtree(session_dir, ignore_errors=True)
 
         return response
 
@@ -1823,6 +1767,16 @@ def create_app() -> Flask:
                 claimed_capture_time=claimed_capture_time,
             )
         except ConflictError as exc:
+            # Retain the contradictory claim for operator review without
+            # publishing private evidence metadata in the diagnostic.
+            exc._proof_id = proof_id  # type: ignore[attr-defined]
+            exc._video_hash = video_hash  # type: ignore[attr-defined]
+            exc._source_address = validated_source_address  # type: ignore[attr-defined]
+            if record_registration_conflict is not None:
+                try:
+                    record_registration_conflict(exc, tx_hash=normalized_tx_hash)
+                except Exception:
+                    pass  # quarantine failure must never suppress the 409
             return jsonify({
                 "error": "idempotency key reused with conflicting payload",
                 "conflict_field": exc.field,

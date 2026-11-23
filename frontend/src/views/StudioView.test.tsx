@@ -5,18 +5,75 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, within } from '@testing-library/react'
+
+vi.mock('../workers/proofWorkerClient', () => ({
+  ProofWorkerClient: class {},
+  ProofWorkerError: class extends Error {},
+}))
+
+vi.mock('../hooks/useWallet', () => ({
+  useWallet: () => ({ wallet: null, networkMismatch: null, connectWallet: vi.fn(), disconnectWallet: vi.fn() }),
+}))
+
+vi.mock('../stellar', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../stellar')>()
+  return {
+    ...actual,
+    isDelegationActive: vi.fn(),
+    getDelegation: vi.fn(),
+  }
+})
+
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+
+vi.mock('../stellar', () => ({
+  CONTRACT_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+  getVerifierState: vi.fn().mockResolvedValue(null),
+  expireProof: vi.fn(),
+  correctProof: vi.fn(),
+}))
+
+vi.mock('../harpocratesRegistry', () => ({
+  CONTRACT_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+  getVerifierState: vi.fn().mockResolvedValue(null),
+  getOpenDisputeCount: vi.fn().mockResolvedValue(0),
+  getProofHistory: vi.fn().mockResolvedValue({ entries: [], total: 0 }),
+  expireProof: vi.fn(),
+  correctProof: vi.fn(),
+}))
+
 import { StudioView } from './StudioView'
-import { buildProofPreparationPreview } from '../proofPreparationPreview'
+import {
+  DELEGATION_SCOPE_REGISTER_SOURCE,
+  DELEGATION_SCOPE_REGISTER_SEAL,
+  isDelegationActive,
+  getDelegation,
+} from '../stellar'
+import {
+  methodForTier,
+  argsForTier,
+  normalizeRegisterProofInput,
+  buildRegisterProofOperation,
+} from '../harpocratesRegistry'
 import type { UseEvidenceReturn } from '../hooks/useEvidence'
 import type { UseVerificationReturn } from '../hooks/useVerification'
 import type { ProofPackage } from '../types'
 
-vi.mock('../harpocratesRegistry', () => ({}))
 vi.mock('../stellar', () => ({
-  CONTRACT_NETWORK_PASSPHRASE: 'Test SDF Future Network ; October 2022',
-  getVerifierState: vi.fn().mockResolvedValue({ currentSetHash: 'a'.repeat(64), count: 1, verifiers: [] }),
+  CONTRACT_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+}))
+vi.mock('../hooks/useIssuerTrust', () => ({
+  useIssuerTrust: () => ({ trust: null, isLoading: false }),
+}))
+vi.mock('../hooks/useVerifierState', () => ({
+  useVerifierState: () => ({ state: null, isLoading: false }),
+}))
+vi.mock('../hooks/useProofRevocationReason', () => ({
+  useProofRevocationReason: () => ({ reason: null }),
+}))
+vi.mock('../hooks/useWallet', () => ({
+  useWallet: () => ({ wallet: '', connectWallet: vi.fn(), networkMismatch: null }),
 }))
 
 function makeVerification(): UseVerificationReturn {
@@ -56,6 +113,8 @@ function makeEvidence(overrides: Partial<UseEvidenceReturn>): UseEvidenceReturn 
     setCredentialSeed: vi.fn(),
     nullifierSeed: '',
     setNullifierSeed: vi.fn(),
+    evidenceNotes: '',
+    setEvidenceNotes: vi.fn(),
     message: 'Upload evidence to begin.',
     proofPreparation: buildProofPreparationPreview({ proof: null, tier: 'silent' }),
     acknowledgedSensitiveFields: [],
@@ -64,16 +123,19 @@ function makeEvidence(overrides: Partial<UseEvidenceReturn>): UseEvidenceReturn 
     networkMismatch: null,
     networkMismatchRecovery: null,
     isCancellable: false,
-    admissionState: null,
-    uploadErrorKind: 'none',
-    isRejectedUpload: false,
-    isInvalidEvidence: false,
+    review: null,
+    reviewInvalidatedReason: null,
+    openReview: vi.fn(),
+    closeReview: vi.fn(),
     handleEvidence: vi.fn(),
-    retryUpload: vi.fn(),
+    retryEvidence: vi.fn(),
     registerProof: vi.fn(),
     revalidateNetworkMismatch: vi.fn(),
     cancelEvidence: vi.fn(),
     cancelProving: vi.fn(),
+    interruptedSession: { category: 'none', fileName: null, interruptedAt: null },
+    resumeEvidence: vi.fn(),
+    discardEvidence: vi.fn(),
     ...overrides,
   }
 }
@@ -166,7 +228,7 @@ describe('StudioView – cancel button', () => {
 
   it('labels the button Cancel proof generation during the proving stage', () => {
     renderStudio(makeEvidence({ stage: 'proving', isCancellable: true, proof }))
-    const cancel = screen.getByRole('button', { name: 'Cancel proof generation' })
+    const cancel = screen.getAllByRole('button', { name: 'Cancel proof generation' })[0]
     expect(cancel).toBeInTheDocument()
     expect(cancel).toHaveTextContent('Cancel proof')
   })
@@ -185,94 +247,379 @@ describe('StudioView – cancel button', () => {
     const cancelEvidence = vi.fn()
     renderStudio(makeEvidence({ stage: 'proving', isCancellable: true, proof, cancelEvidence }))
 
-    const cancel = screen.getByRole('button', { name: 'Cancel proof generation' })
+    const cancel = screen.getAllByRole('button', { name: 'Cancel proof generation' })[0]
     cancel.focus()
     await user.keyboard('{Enter}')
     expect(cancelEvidence).toHaveBeenCalledTimes(1)
   })
 })
 
-describe('StudioView – upload admission and queue state', () => {
-  it('renders admission queue banner when upload is rejected by queue limits', () => {
-    renderStudio(
-      makeEvidence({
-        stage: 'error',
-        isRejectedUpload: true,
-        admissionState: {
-          status: 'rejected',
-          reason: 'queue_full',
-          message: 'Upload queue is full. Try again in 5s.',
-          retryAfter: 5,
-          retryable: true,
-          actionHint: 'retry',
-        },
-      }),
-    )
+import { StrKey } from '@stellar/stellar-sdk'
 
-    expect(screen.getByTestId('admission-queue-banner')).toBeInTheDocument()
-    expect(screen.getByTestId('admission-queue-title')).toHaveTextContent(/Rejected \(queue full\)/i)
-    expect(screen.getByTestId('admission-queue-message')).toHaveTextContent('Upload queue is full. Try again in 5s.')
-    expect(screen.getByTestId('admission-queue-retry-hint')).toHaveTextContent('5s')
-    expect(screen.getByRole('button', { name: 'Retry upload' })).toBeInTheDocument()
-    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('REJECTED (queue_full)')
+const TEST_WALLET = StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 1))
+const GRANTOR_ADDRESS = StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 2))
+const TEST_CONTRACT = StrKey.encodeContract(Buffer.alloc(32, 3))
+
+function makeSourceEvidence(overrides: Partial<UseEvidenceReturn> = {}): UseEvidenceReturn {
+  return makeEvidence({
+    selectedTier: 'source',
+    selectedTierMeta: {
+      id: 'source',
+      title: 'Consistent Source',
+      label: 'Persistent Identity',
+      icon: vi.fn(),
+      description: 'Public identity proof.',
+    },
+    stage: 'ready',
+    proof: {
+      fileName: 'clip.mp4',
+      sourceHash: '1'.repeat(64),
+      videoHash: '2'.repeat(64),
+      metadataHash: '3'.repeat(64),
+      proofId: '4'.repeat(64),
+      timestamp: '2026-01-01T00:00:00.000Z',
+      tier: 'source',
+    },
+    ...overrides,
+  })
+}
+
+function makeSealEvidence(overrides: Partial<UseEvidenceReturn> = {}): UseEvidenceReturn {
+  return makeEvidence({
+    selectedTier: 'seal',
+    selectedTierMeta: {
+      id: 'seal',
+      title: 'Public Seal',
+      label: 'Public Seal',
+      icon: vi.fn(),
+      description: 'Official organization seal.',
+    },
+    stage: 'ready',
+    proof: {
+      fileName: 'clip.mp4',
+      sourceHash: '1'.repeat(64),
+      videoHash: '2'.repeat(64),
+      metadataHash: '3'.repeat(64),
+      proofId: '4'.repeat(64),
+      timestamp: '2026-01-01T00:00:00.000Z',
+      tier: 'seal',
+    },
+    ...overrides,
+  })
+}
+
+describe('StudioView – delegated registration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
   })
 
-  it('triggers retryUpload when Retry Upload button is clicked', async () => {
+  it('leaves direct registration unchanged when no grantor address is entered', async () => {
     const user = userEvent.setup()
-    const retryUpload = vi.fn()
-    renderStudio(
-      makeEvidence({
-        stage: 'error',
-        isRejectedUpload: true,
-        retryUpload,
-        admissionState: {
-          status: 'rejected',
-          reason: 'identity_limit',
-          message: 'Concurrent upload limit reached for tier.',
-          retryAfter: 10,
-          retryable: true,
-          actionHint: 'retry',
-        },
-      }),
+    const registerProof = vi.fn()
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSourceEvidence({ registerProof })}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
     )
 
-    await user.click(screen.getByRole('button', { name: 'Retry upload' }))
-    expect(retryUpload).toHaveBeenCalledTimes(1)
+    const registerBtn = screen.getByRole('button', { name: 'Register proof' })
+    expect(registerBtn).not.toBeDisabled()
+
+    await user.click(registerBtn)
+    expect(registerProof).toHaveBeenCalledTimes(1)
+    expect(registerProof).toHaveBeenCalledWith(TEST_WALLET, undefined)
   })
 
-  it('renders invalid evidence banner distinct from admission rejection', () => {
-    renderStudio(
-      makeEvidence({
-        stage: 'error',
-        isInvalidEvidence: true,
-        isRejectedUpload: false,
-        admissionState: null,
-        message: 'Unsupported video container format.',
-      }),
+  it('enables delegated registration and displays attribution & expiry when active grant exists for Tier 2', async () => {
+    const user = userEvent.setup()
+    const registerProof = vi.fn()
+    vi.mocked(isDelegationActive).mockResolvedValue(true)
+    vi.mocked(getDelegation).mockResolvedValue({
+      grantor: GRANTOR_ADDRESS,
+      delegate: TEST_WALLET,
+      scope: DELEGATION_SCOPE_REGISTER_SOURCE,
+      expiresAt: 2000000000,
+    })
+
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSourceEvidence({ registerProof })}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
     )
 
-    expect(screen.getByTestId('invalid-evidence-banner')).toBeInTheDocument()
-    expect(screen.getByTestId('invalid-evidence-message')).toHaveTextContent('Unsupported video container format.')
-    expect(screen.queryByTestId('admission-queue-banner')).not.toBeInTheDocument()
-    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('IDLE')
+    const grantorInput = screen.getByPlaceholderText(/leave empty for direct registration/i)
+    await user.type(grantorInput, GRANTOR_ADDRESS)
+
+    await waitFor(() => {
+      expect(isDelegationActive).toHaveBeenCalledWith(
+        expect.any(String),
+        GRANTOR_ADDRESS,
+        TEST_WALLET,
+        DELEGATION_SCOPE_REGISTER_SOURCE,
+      )
+    })
+
+    expect(
+      screen.getByText(/Attribution: The registered proof will be attributed to grantor/i),
+    ).toBeInTheDocument()
+    expect(screen.getByText(GRANTOR_ADDRESS)).toBeInTheDocument()
+    expect(screen.getByText(/Active delegation verified/i)).toBeInTheDocument()
+    expect(screen.getByText(new RegExp(new Date(2000000000 * 1000).toISOString()))).toBeInTheDocument()
+
+    const submitBtn = screen.getByRole('button', { name: 'Register proof (delegated)' })
+    expect(submitBtn).not.toBeDisabled()
+
+    await user.click(submitBtn)
+    expect(registerProof).toHaveBeenCalledTimes(1)
+    expect(registerProof).toHaveBeenCalledWith(TEST_WALLET, GRANTOR_ADDRESS)
   })
 
-  it('renders ADMITTED in data list when evidence proof is ready', () => {
-    renderStudio(
-      makeEvidence({
-        stage: 'ready',
-        proof,
-        admissionState: {
-          status: 'admitted',
-          reason: null,
-          message: 'Upload admitted and processed successfully.',
-          retryAfter: null,
-          retryable: false,
-          actionHint: 'none',
-        },
-      }),
+  it('enables delegated registration when active grant exists for Tier 3 Public Seal', async () => {
+    const user = userEvent.setup()
+    const registerProof = vi.fn()
+    vi.mocked(isDelegationActive).mockResolvedValue(true)
+    vi.mocked(getDelegation).mockResolvedValue({
+      grantor: GRANTOR_ADDRESS,
+      delegate: TEST_WALLET,
+      scope: DELEGATION_SCOPE_REGISTER_SEAL,
+      expiresAt: 2000000000,
+    })
+
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSealEvidence({ registerProof })}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
     )
 
-    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('ADMITTED')
+    const grantorInput = screen.getByPlaceholderText(/leave empty for direct registration/i)
+    await user.type(grantorInput, GRANTOR_ADDRESS)
+
+    await waitFor(() => {
+      expect(isDelegationActive).toHaveBeenCalledWith(
+        expect.any(String),
+        GRANTOR_ADDRESS,
+        TEST_WALLET,
+        DELEGATION_SCOPE_REGISTER_SEAL,
+      )
+    })
+
+    const submitBtn = screen.getByRole('button', { name: 'Register proof (delegated)' })
+    expect(submitBtn).not.toBeDisabled()
+
+    await user.click(submitBtn)
+    expect(registerProof).toHaveBeenCalledWith(TEST_WALLET, GRANTOR_ADDRESS)
+  })
+
+  it('blocks submission and displays clear error message when grant is missing', async () => {
+    const user = userEvent.setup()
+    vi.mocked(isDelegationActive).mockResolvedValue(false)
+    vi.mocked(getDelegation).mockResolvedValue(null)
+
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSourceEvidence()}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
+    )
+
+    const grantorInput = screen.getByPlaceholderText(/leave empty for direct registration/i)
+    await user.type(grantorInput, GRANTOR_ADDRESS)
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'No delegation grant found from this grantor to your wallet.',
+      )
+    })
+
+    const submitBtn = screen.getByRole('button', { name: 'Register proof (delegated)' })
+    expect(submitBtn).toBeDisabled()
+  })
+
+  it('blocks submission and displays clear error message when grant is expired', async () => {
+    const user = userEvent.setup()
+    vi.mocked(isDelegationActive).mockResolvedValue(false)
+    vi.mocked(getDelegation).mockResolvedValue({
+      grantor: GRANTOR_ADDRESS,
+      delegate: TEST_WALLET,
+      scope: DELEGATION_SCOPE_REGISTER_SOURCE,
+      expiresAt: 1600000000, // Past timestamp
+    })
+
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSourceEvidence()}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
+    )
+
+    const grantorInput = screen.getByPlaceholderText(/leave empty for direct registration/i)
+    await user.type(grantorInput, GRANTOR_ADDRESS)
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/Delegation has expired/i)
+    })
+
+    const submitBtn = screen.getByRole('button', { name: 'Register proof (delegated)' })
+    expect(submitBtn).toBeDisabled()
+  })
+
+  it('blocks submission and displays clear error message when grant has wrong scope', async () => {
+    const user = userEvent.setup()
+    vi.mocked(isDelegationActive).mockResolvedValue(false)
+    vi.mocked(getDelegation).mockResolvedValue({
+      grantor: GRANTOR_ADDRESS,
+      delegate: TEST_WALLET,
+      scope: DELEGATION_SCOPE_REGISTER_SEAL, // Wrong scope for source tier
+      expiresAt: 2000000000,
+    })
+
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSourceEvidence()}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
+    )
+
+    const grantorInput = screen.getByPlaceholderText(/leave empty for direct registration/i)
+    await user.type(grantorInput, GRANTOR_ADDRESS)
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'Delegation does not grant permission for Consistent Source registration.',
+      )
+    })
+
+    const submitBtn = screen.getByRole('button', { name: 'Register proof (delegated)' })
+    expect(submitBtn).toBeDisabled()
+  })
+
+  it('blocks submission and displays error when grantor address is invalid format', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSourceEvidence()}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
+    )
+
+    const grantorInput = screen.getByPlaceholderText(/leave empty for direct registration/i)
+    await user.type(grantorInput, 'invalid-stellar-address')
+
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Grantor address must be a valid 56-character Stellar address',
+    )
+
+    const submitBtn = screen.getByRole('button', { name: 'Register proof (delegated)' })
+    expect(submitBtn).toBeDisabled()
+    expect(isDelegationActive).not.toHaveBeenCalled()
+  })
+
+  it('blocks submission and displays error when grantor is the connected wallet itself', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeSourceEvidence()}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
+    )
+
+    const grantorInput = screen.getByPlaceholderText(/leave empty for direct registration/i)
+    await user.type(grantorInput, TEST_WALLET)
+
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Grantor cannot be your own wallet address. Use direct registration instead.',
+    )
+
+    const submitBtn = screen.getByRole('button', { name: 'Register proof (delegated)' })
+    expect(submitBtn).toBeDisabled()
+    expect(isDelegationActive).not.toHaveBeenCalled()
+  })
+
+  it('does not display grantor input when Silent tier is selected', () => {
+    render(
+      <StudioView
+        wallet={TEST_WALLET}
+        evidence={makeEvidence({ selectedTier: 'silent' })}
+        verification={makeVerification()}
+        provenanceRecord={null}
+      />,
+    )
+
+    expect(
+      screen.queryByPlaceholderText(/leave empty for direct registration/i),
+    ).not.toBeInTheDocument()
+  })
+})
+
+describe('harpocratesRegistry – delegated transaction builders', () => {
+  it('selects register_source for direct Tier 2 registration and register_source_delegated for delegated', () => {
+    expect(methodForTier('source', false)).toBe('register_source')
+    expect(methodForTier('source', true)).toBe('register_source_delegated')
+  })
+
+  it('selects register_seal for direct Tier 3 registration and register_seal_delegated for delegated', () => {
+    expect(methodForTier('seal', false)).toBe('register_seal')
+    expect(methodForTier('seal', true)).toBe('register_seal_delegated')
+  })
+
+  it('constructs correct arguments for delegated registration', () => {
+    const input = normalizeRegisterProofInput({
+      contractId: TEST_CONTRACT,
+      publicKey: TEST_WALLET,
+      grantor: GRANTOR_ADDRESS,
+      videoHash: '1'.repeat(64),
+      metadataHash: '2'.repeat(64),
+      proofId: '3'.repeat(64),
+      tier: 'source',
+    })
+    const args = argsForTier(input)
+    expect(args).toHaveLength(5)
+  })
+
+  it('constructs correct arguments for direct registration', () => {
+    const input = normalizeRegisterProofInput({
+      contractId: TEST_CONTRACT,
+      publicKey: TEST_WALLET,
+      videoHash: '1'.repeat(64),
+      metadataHash: '2'.repeat(64),
+      proofId: '3'.repeat(64),
+      tier: 'source',
+    })
+    const args = argsForTier(input)
+    expect(args).toHaveLength(4)
+  })
+
+  it('builds a valid contract call operation for delegated registration', () => {
+    const op = buildRegisterProofOperation(TEST_CONTRACT, {
+      contractId: TEST_CONTRACT,
+      publicKey: TEST_WALLET,
+      grantor: GRANTOR_ADDRESS,
+      videoHash: '1'.repeat(64),
+      metadataHash: '2'.repeat(64),
+      proofId: '3'.repeat(64),
+      tier: 'source',
+    })
+    expect(op).toBeDefined()
   })
 })

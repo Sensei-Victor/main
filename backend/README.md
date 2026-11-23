@@ -110,6 +110,7 @@ This section documents all environment variables that can be used to configure t
 | SECURITY_HEADERS_ENABLED | boolean | true |  | Enable or disable security headers (X-Content-Type-Options, etc.) | no | no |
 | TRUSTED_PROXIES | list of strings |  |  | Comma-separated list of trusted proxy CIDR ranges for IP address resolution | no | no |
 | UPLOAD_CHUNK_BYTES | string |  |  | Size of upload chunks in bytes (clamped between 4096 and 1048576) | no | no |
+| UPLOAD_SESSION_TTL_SECONDS | integer | 3600 | must be positive | Time-to-live for upload sessions in seconds | no | no |
 | VERIFIER_CACHE_MAX_SIZE | integer | 10000 | must be positive | Maximum number of entries in the verifier proof cache | no | no |
 | VERIFIER_CACHE_NEGATIVE_TTL_SECONDS | float | 300.0 | must be positive | Time-to-live for negative verifier cache entries (seconds) | no | no |
 | VERIFIER_CACHE_POSITIVE_TTL_SECONDS | float | 86400.0 | must be positive | Time-to-live for positive verifier cache entries (seconds) | no | no |
@@ -129,6 +130,64 @@ cursor at the last fully processed page; the worker backs off and retries from
 that cursor. Replayed projections are idempotent on `(tx_hash, event_index)`,
 so rows committed before a failed page retry are treated as duplicates. No
 additional configuration or database migration is required.
+
+## Upload Admission Decision Schema
+
+Admission-controlled upload routes return a stable decision payload when they
+reject work. The legacy top-level `reason` (`identity_limit`, `queue_full`, or
+`timeout`) is retained for existing callers; new callers should use
+`error.admission`.
+
+| Stable code | Stable reason | HTTP | Meaning |
+| --- | --- | --- | --- |
+| `ADMISSION_IDENTITY_QUOTA` | `identity_quota` | 429 | The caller has reached its configured concurrent-upload quota. |
+| `ADMISSION_QUEUE_SATURATION` | `queue_saturation` | 503 | The bounded admission queue is full. |
+| `ADMISSION_PROCESSING_CAPACITY` | `processing_capacity` | 503 | A processing slot did not become available before the admission timeout. |
+
+Rejections use the standard error envelope plus an `admission` object:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "ADMISSION_QUEUE_SATURATION",
+    "message": "upload admission queue is full",
+    "request_id": "a1b2c3d4-...",
+    "admission": {
+      "code": "ADMISSION_QUEUE_SATURATION",
+      "reason": "queue_saturation",
+      "message": "upload admission queue is full",
+      "retryAfterSeconds": 10,
+      "retryable": true
+    }
+  },
+  "reason": "queue_full",
+  "admissionReason": "queue_saturation",
+  "retryAfterSeconds": 10
+}
+```
+
+`retryAfterSeconds` is bounded to 1–60 seconds and always matches the
+`Retry-After` response header. Messages never include client identity, queue
+depth, concurrency counters, or other callers' state. No new environment
+variables are required.
+
+## Upload Session Cancellation
+
+Upload sessions created by `POST /api/stego/upload-session` can be cancelled with
+`POST /api/stego/upload-session/<session_id>/cancel`. Cancellation is accepted
+while the session is queued, receiving chunks, or committing; terminal sessions
+return `409 UPLOAD_NOT_CANCELLABLE`, and unknown sessions return `404`.
+
+A queued admission ticket is released immediately. An active ticket moves to the
+`cancelling` state and is released when the in-flight chunk or commit request
+finishes. Cancellation removes the session's temporary directory only after all
+active writers stop, so a concurrent chunk never loses bytes mid-write. Further
+chunk, commit, or bounded-hash work on the cancelled session returns
+`409 UPLOAD_CANCELLED`.
+
+No additional environment variables are required; cancellation reuses the
+existing admission and upload settings.
 
 ## Upload and Verification Load Test
 
@@ -248,23 +307,18 @@ new numbered migration instead.
 python manage.py migrate                    # apply pending migrations
 python manage.py migrate --check            # verify checksums, list pending; applies nothing
 python manage.py drift                      # compare live schema with the expected schema
-python manage.py retention --dry-run        # count expired, non-held proof events
-python manage.py retention --run            # purge them (batch: HARPOCRATES_RETENTION_BATCH_SIZE)
-python manage.py retention --run --batch-size 500
+python manage.py retention --dry-run        # preview expired proof events and upload sessions
+python manage.py retention --run            # purge expired proof events and upload sessions
+python manage.py retention --run --batch-size 500 --session-limit 1000
 python manage.py reconcile --limit 25       # reconcile pending registration txs (max 50)
 python manage.py projection-reconcile --start-ledger 1000 --end-ledger 1100 --contract-id C... --limit 1000
 python manage.py --json drift               # machine-readable JSON output
 ```
 
-`projection-reconcile` is read-only. It compares recognized lifecycle events
-in the inclusive ledger range with `proof_events` rows keyed by
-`(tx_hash, event_index)`, reporting absent projections separately from rows
-whose projected fields conflict with chain data. The range is limited to
-10,000 ledgers and the event limit defaults to 1,000 (maximum 10,000); an
-exceeded event limit returns an incomplete report rather than a clean result.
-Exit code `1` indicates a discrepancy or incomplete range. The command needs
-`DATABASE_URL` and `--contract-id`; the RPC endpoint can be selected with
-`--rpc-url`, `SOROBAN_RPC_URL`, or `STELLAR_RPC_URL`.
+`retention --dry-run` and `retention --run` evaluate both database proof events and disk-backed streaming upload sessions:
+- `--session-limit` bounds upload session directory scanning (default: 500).
+- Upload session preview reports `total_sessions_scanned`, `expired_sessions_count`, `active_worker_sessions_skipped`, `reclaimable_bytes`, `bounded_limit_reached`, and per-session previews.
+- Sessions actively in use by workers (`AdmissionController`) are strictly preserved and skipped.
 
 Exit codes:
 

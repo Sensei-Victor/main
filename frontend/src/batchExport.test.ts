@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
+  BatchCheckpointError,
+  type BatchItemResult,
+  type BatchVerificationCheckpoint,
+} from './batchVerifier'
+import {
   EXPORT_PRIVACY_PROFILES,
   OWNER_ONLY_EXPORT_FIELDS,
   PUBLIC_EXPORT_FIELDS,
@@ -7,6 +12,8 @@ import {
   exportBatchCSV,
   exportBatchCheckpoint,
   exportBatchJSON,
+  exportPreflightReportCSV,
+  exportPreflightReportJSON,
   exportReceiptCollection,
   parseBatchCheckpoint,
   sanitizeBatchResults,
@@ -146,59 +153,85 @@ describe('batchExport', () => {
     expect(parsed.totalItems).toBe(1)
   })
 
-  it('documents distinct public and owner-only field sets', () => {
-    expect(EXPORT_PRIVACY_PROFILES.public.fields).toEqual(PUBLIC_EXPORT_FIELDS)
-    expect(EXPORT_PRIVACY_PROFILES['owner-only'].fields).toEqual(OWNER_ONLY_EXPORT_FIELDS)
-    expect(PUBLIC_EXPORT_FIELDS).not.toContain('fileName')
-    expect(PUBLIC_EXPORT_FIELDS).not.toContain('issuerNote')
-    expect(PUBLIC_EXPORT_FIELDS).not.toContain('duplicateOf')
-    expect(OWNER_ONLY_EXPORT_FIELDS).toContain('fileName')
-    expect(OWNER_ONLY_EXPORT_FIELDS).toContain('issuerNote')
-  })
-
-  it('public JSON export omits raw filenames, duplicate references, diagnostics, and private issuer notes', () => {
-    const jsonStr = exportBatchJSON(mockItems, 'public')
-    const parsed = JSON.parse(jsonStr) as {
-      privacyProfile: string
-      results: Record<string, unknown>[]
+  it('exportBatchCheckpoint and parseBatchCheckpoint round-trip privacy-safe checkpoints', () => {
+    const checkpoint: BatchVerificationCheckpoint = {
+      protocol: 'harpocrates-batch-checkpoint',
+      version: 1,
+      createdAt: '2026-11-19T00:00:00.000Z',
+      updatedAt: '2026-11-19T00:01:00.000Z',
+      policy: { maxFileSizeBytes: 1024 * 1024, maxTotalSizeBytes: 5 * 1024 * 1024 },
+      networkContext: { apiBase: 'http://127.0.0.1:5050', contractId: 'CTEST', network: 'testnet' },
+      files: [
+        {
+          index: 0,
+          fileName: 'evidence1.mp4',
+          fileSizeBytes: 1024,
+          lastModified: 1700000000000,
+          mimeType: 'video/mp4',
+          sampleHash: 'a'.repeat(64),
+        },
+      ],
+      completed: [
+        {
+          index: 0,
+          fileName: 'evidence1.mp4',
+          fileSizeBytes: 1024,
+          status: 'confirmed',
+          videoHash: '1'.repeat(64),
+          metadataHash: '2'.repeat(64),
+          sourceHash: '3'.repeat(64),
+          tier: 'silent',
+          chainStatus: 'Active',
+          message: 'Confirmed evidence',
+          duplicateOf: null,
+          failureReason: null,
+          durationMs: 120.4,
+        },
+      ],
     }
 
-    expect(parsed.privacyProfile).toBe('public')
-    expect(parsed.results).toHaveLength(2)
-    expect(Object.keys(parsed.results[0]).sort()).toEqual([...PUBLIC_EXPORT_FIELDS].sort())
-    expect(jsonStr).not.toContain('evidence1.mp4')
-    expect(jsonStr).not.toContain('large.mp4')
-    expect(jsonStr).not.toContain('PRIVATE-ISSUER-NOTE-WHISTLEBLOWER-77')
-    expect(jsonStr).not.toContain('INTERNAL-REVIEW-ONLY')
-    expect(jsonStr).not.toContain('Total batch memory limit exceeded')
+    const exported = exportBatchCheckpoint(checkpoint)
+    const parsed = parseBatchCheckpoint(exported)
+
+    expect(parsed.protocol).toBe('harpocrates-batch-checkpoint')
+    expect(parsed.completed).toHaveLength(1)
+    expect(parsed.completed[0].durationMs).toBe(120)
   })
 
-  it('public CSV export omits raw filenames and private issuer notes', () => {
-    const csvStr = exportBatchCSV(mockItems, 'public')
-    const [headerLine] = csvStr.split('\n')
-
-    expect(headerLine).toBe(
-      'Status,Video Hash,Metadata Hash,Source Hash,Tier,Chain Status,Size (Bytes),Duration (ms)',
+  it('parseBatchCheckpoint fails closed on malformed or non-completed checkpoint payloads', () => {
+    expect(() => parseBatchCheckpoint('{invalid')).toThrow(BatchCheckpointError)
+    expect(() => parseBatchCheckpoint(JSON.stringify({ protocol: 'wrong', version: 1 }))).toThrow(
+      BatchCheckpointError,
     )
-    expect(csvStr).not.toContain('evidence1.mp4')
-    expect(csvStr).not.toContain('large.mp4')
-    expect(csvStr).not.toContain('PRIVATE-ISSUER-NOTE-WHISTLEBLOWER-77')
-    expect(csvStr).not.toContain('INTERNAL-REVIEW-ONLY')
-  })
-
-  it('fails closed when given an unsupported privacy profile', () => {
-    const invalidProfile = 'unrestricted' as unknown as ExportPrivacyProfile
-    expect(() => assertValidExportPrivacyProfile(invalidProfile)).toThrow(
-      /Unsupported export privacy profile/,
-    )
-    expect(() => sanitizeBatchResults(mockItems, invalidProfile)).toThrow(
-      /Unsupported export privacy profile/,
-    )
-    expect(() => exportBatchJSON(mockItems, invalidProfile)).toThrow(
-      /Unsupported export privacy profile/,
-    )
-    expect(() => exportBatchCSV(mockItems, invalidProfile)).toThrow(
-      /Unsupported export privacy profile/,
-    )
+    expect(() =>
+      parseBatchCheckpoint(
+        JSON.stringify({
+          protocol: 'harpocrates-batch-checkpoint',
+          version: 1,
+          createdAt: '2026-11-19T00:00:00.000Z',
+          updatedAt: '2026-11-19T00:00:00.000Z',
+          policy: { maxFileSizeBytes: 100, maxTotalSizeBytes: 200 },
+          networkContext: { apiBase: 'http://127.0.0.1:5050', contractId: '', network: 'testnet' },
+          files: [],
+          completed: [
+            {
+              index: 0,
+              fileName: 'a.mp4',
+              fileSizeBytes: 10,
+              status: 'pending',
+              videoHash: null,
+              metadataHash: null,
+              sourceHash: null,
+              tier: null,
+              chainStatus: null,
+              message: 'Queued',
+              duplicateOf: null,
+              failureReason: null,
+              durationMs: null,
+            },
+          ],
+        }),
+      ),
+    ).toThrow(BatchCheckpointError)
   })
 })

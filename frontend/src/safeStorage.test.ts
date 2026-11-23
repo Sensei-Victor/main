@@ -1,12 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  createIsolatedSafeStorage,
-  createIsolatedStateContainer,
   safeLocalStorage,
   safeSessionStorage,
+  STORAGE_KEY,
+  VAULT_STORAGE_KEY,
+  addCrossTabStorageListener,
 } from './safeStorage'
-
-const STORAGE_KEY = 'harpocrates:ui-preferences'
 
 describe.each([
   ['localStorage', safeLocalStorage],
@@ -138,44 +137,121 @@ describe.each([
   })
 })
 
-describe('Isolated storage containers', () => {
-  it('conforms to standard Storage interface and isolates mutations in memory', () => {
-    const container = createIsolatedStateContainer()
-    expect(container.length).toBe(0)
-    expect(container.getItem('key1')).toBeNull()
-
-    container.setItem('key1', 'val1')
-    container.setItem('key2', 'val2')
-    expect(container.length).toBe(2)
-    expect(container.getItem('key1')).toBe('val1')
-    expect(container.key(0)).toBe('key1')
-
-    container.removeItem('key1')
-    expect(container.length).toBe(1)
-    expect(container.getItem('key1')).toBeNull()
-
-    container.clear()
-    expect(container.length).toBe(0)
-    expect(container.getItem('key2')).toBeNull()
-  })
-
-  it('createIsolatedSafeStorage isolates UI preferences without touching window storage', () => {
+describe('addCrossTabStorageListener', () => {
+  beforeEach(() => {
     window.localStorage.clear()
     window.sessionStorage.clear()
+    vi.restoreAllMocks()
+  })
 
-    const isolatedStorage = createIsolatedSafeStorage()
-    isolatedStorage.setUiPreferences({
-      currentView: 'studio',
-      vaultRecoveryRehearsed: true,
+  it('notifies listener when storage event matches target key', () => {
+    const listener = vi.fn()
+    const unsubscribe = addCrossTabStorageListener(VAULT_STORAGE_KEY, listener)
+
+    const event = new StorageEvent('storage', {
+      key: VAULT_STORAGE_KEY,
+      oldValue: '{"v":1,"salt":"a"}',
+      newValue: '{"v":1,"salt":"b"}',
+      storageArea: window.localStorage,
+    })
+    window.dispatchEvent(event)
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith({
+      key: VAULT_STORAGE_KEY,
+      oldValue: '{"v":1,"salt":"a"}',
+      newValue: '{"v":1,"salt":"b"}',
+      storageArea: window.localStorage,
     })
 
-    expect(isolatedStorage.getUiPreferences()).toEqual({
-      currentView: 'studio',
-      vaultRecoveryRehearsed: true,
+    unsubscribe()
+  })
+
+  it('notifies listener when storage is cleared (key is null)', () => {
+    const listener = vi.fn()
+    const unsubscribe = addCrossTabStorageListener(VAULT_STORAGE_KEY, listener)
+
+    const clearEvent = new StorageEvent('storage', {
+      key: null,
+      oldValue: null,
+      newValue: null,
+      storageArea: window.localStorage,
+    })
+    window.dispatchEvent(clearEvent)
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith({
+      key: null,
+      oldValue: null,
+      newValue: null,
+      storageArea: window.localStorage,
     })
 
-    // Browser storages remain completely untouched
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
-    expect(window.sessionStorage.getItem(STORAGE_KEY)).toBeNull()
+    unsubscribe()
+  })
+
+  it('ignores storage events for other keys', () => {
+    const listener = vi.fn()
+    const unsubscribe = addCrossTabStorageListener(VAULT_STORAGE_KEY, listener)
+
+    const irrelevantEvent = new StorageEvent('storage', {
+      key: 'some-other-key',
+      oldValue: 'old',
+      newValue: 'new',
+      storageArea: window.localStorage,
+    })
+    window.dispatchEvent(irrelevantEvent)
+
+    expect(listener).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('ignores storage events originating from sessionStorage', () => {
+    const listener = vi.fn()
+    const unsubscribe = addCrossTabStorageListener(VAULT_STORAGE_KEY, listener)
+
+    const sessionEvent = new StorageEvent('storage', {
+      key: VAULT_STORAGE_KEY,
+      oldValue: 'old',
+      newValue: 'new',
+      storageArea: window.sessionStorage,
+    })
+    window.dispatchEvent(sessionEvent)
+
+    expect(listener).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('stops listening when unsubscribed', () => {
+    const listener = vi.fn()
+    const unsubscribe = addCrossTabStorageListener(VAULT_STORAGE_KEY, listener)
+
+    unsubscribe()
+
+    const event = new StorageEvent('storage', {
+      key: VAULT_STORAGE_KEY,
+      oldValue: 'a',
+      newValue: 'b',
+      storageArea: window.localStorage,
+    })
+    window.dispatchEvent(event)
+
+    expect(listener).not.toHaveBeenCalled()
+  })
+
+  it('safeLocalStorage.onKeyChange provides equivalent listener', () => {
+    const listener = vi.fn()
+    const unsubscribe = safeLocalStorage.onKeyChange(VAULT_STORAGE_KEY, listener)
+
+    const event = new StorageEvent('storage', {
+      key: VAULT_STORAGE_KEY,
+      oldValue: null,
+      newValue: 'new-envelope',
+      storageArea: window.localStorage,
+    })
+    window.dispatchEvent(event)
+
+    expect(listener).toHaveBeenCalledOnce()
+    unsubscribe()
   })
 })

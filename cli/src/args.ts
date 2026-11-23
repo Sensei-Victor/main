@@ -7,10 +7,13 @@ export type Command =
   | 'manifest'
   | 'hash'
   | 'verify-receipt'
+  | 'compare-receipt'
   | 'c2pa'
   | 'verify-lineage'
   | 'verify-bundle'
   | 'compare-trust-policy'
+  | 'register'
+  | 'version' main
   | 'help'
 
 export interface ParsedArgs {
@@ -102,6 +105,17 @@ const COMMAND_OPTIONS: Record<Exclude<Command, 'help'>, OptionSet> = {
     output: alias('o'),
     debug: toggle,
   },
+  'compare-receipt': {
+    base: alias('b'),
+    target: alias('t'),
+    'receipt-a': text,
+    receiptA: text,
+    'receipt-b': text,
+    receiptB: text,
+    candidate: text,
+    output: alias('o'),
+    debug: toggle,
+  },
   c2pa: {
     manifest: alias('m'),
     receipt: alias('r'),
@@ -122,9 +136,25 @@ const COMMAND_OPTIONS: Record<Exclude<Command, 'help'>, OptionSet> = {
     output: alias('o'),
     debug: toggle,
   },
-  'verify-bundle': {
-    bundle: alias('b'),
+  register: {
+    kind: text,
+    'contract-id': text,
+    contractId: text,
+    'proof-id': text,
+    proofId: text,
+    'video-hash': text,
+    videoHash: text,
+    'source-hash': text,
+    sourceHash: text,
+    'metadata-hash': text,
+    metadataHash: text,
+    'rpc-url': text,
+    rpcUrl: text,
     network: text,
+    'signer-file': text,
+    signerFile: text,
+    'dry-run': toggle,
+    dryRun: toggle,
     output: alias('o'),
     debug: toggle,
   },
@@ -137,6 +167,7 @@ const COMMAND_OPTIONS: Record<Exclude<Command, 'help'>, OptionSet> = {
     output: alias('o'),
     debug: toggle,
   },
+  version: {},
 }
 
 // Environment variable defaults for flags that are otherwise required on every call.
@@ -158,6 +189,10 @@ const ENV_DEFAULTS: Partial<Record<Exclude<Command, 'help'>, { keys: string[]; e
     keys: [],
     env: '',
   },
+  'compare-receipt': {
+    keys: [],
+    env: '',
+  },
   c2pa: {
     keys: [],
     env: '',
@@ -166,7 +201,11 @@ const ENV_DEFAULTS: Partial<Record<Exclude<Command, 'help'>, { keys: string[]; e
     keys: [],
     env: '',
   },
-  'verify-bundle': {
+  register: {
+    keys: [],
+    env: '',
+  },
+  version: {
     keys: [],
     env: '',
   },
@@ -203,15 +242,28 @@ function describeUsageError(command: string, err: unknown): string {
 }
 
 export function parseCliArgs(argv: string[]): ParsedArgs {
-  const [command, ...rest] = argv
+  if (argv.length > 0 && (argv[0] === '--version' || argv[0] === '-v' || argv[0] === 'version')) {
+    return { command: 'version', flags: {} }
+  }
+
+  let [rawCommand, ...rest] = argv
+  if (rawCommand === 'compare') {
+    rawCommand = 'compare-receipt'
+  }
+
+  const command = rawCommand
   if (command === undefined || !Object.prototype.hasOwnProperty.call(COMMAND_OPTIONS, command)) {
     return { command: 'help', flags: {} }
   }
 
   const options = COMMAND_OPTIONS[command as Exclude<Command, 'help'>]
+  const allowPositionals = command === 'compare-receipt'
   let values: Record<string, unknown>
+  let positionals: string[] = []
   try {
-    values = parseArgs({ args: rest, options, strict: true, allowPositionals: false }).values
+    const parsed = parseArgs({ args: rest, options, strict: true, allowPositionals })
+    values = parsed.values
+    positionals = parsed.positionals
   } catch (err) {
     throw new CliUsageError(describeUsageError(command, err))
   }
@@ -221,6 +273,19 @@ export function parseCliArgs(argv: string[]): ParsedArgs {
   for (const [key, value] of Object.entries(values)) {
     if (value !== undefined) flags[key] = String(value)
   }
+
+  if (command === 'compare-receipt') {
+    if (positionals.length > 2) {
+      throw new CliUsageError(`unexpected argument '${positionals[2]}' for '${command}'; ${HELP_HINT}`)
+    }
+    if (positionals.length > 0 && !flags.base && !flags.b && !flags['receipt-a'] && !flags.receiptA) {
+      flags.base = positionals[0]
+    }
+    if (positionals.length > 1 && !flags.target && !flags.t && !flags['receipt-b'] && !flags.receiptB && !flags.candidate) {
+      flags.target = positionals[1]
+    }
+  }
+
   if (flags.timeout !== undefined) {
     const timeout = Number(flags.timeout)
     if (!Number.isInteger(timeout) || timeout <= 0) {

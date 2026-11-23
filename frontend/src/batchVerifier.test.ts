@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   BatchCheckpointError,
   BatchVerifier,
-  classifyBatchOutcome,
   computeBatchFingerprints,
   computeChunkedSha256,
   computeFileFingerprint,
@@ -12,6 +11,33 @@ import {
   type BatchVerificationCheckpoint,
 } from './batchVerifier'
 import * as verificationFlow from './verificationFlow'
+
+const { StegoError, extractMetadata } = vi.hoisted(() => {
+  class StegoError extends Error {
+    constructor() {
+      super('Malformed evidence')
+      this.name = 'MalformedEvidenceError'
+    }
+  }
+  return {
+    StegoError,
+    extractMetadata: vi.fn().mockImplementation(async (file: { name?: string }) => {
+      if (file?.name && (file.name.includes('bad') || file.name.includes('corrupt'))) {
+        throw new StegoError()
+      }
+      return { protocol: 'harpocrates' }
+    }),
+  }
+})
+
+vi.mock('./stego', () => ({
+  extractMetadata,
+  MalformedEvidenceError: StegoError,
+}))
+
+vi.mock('./stellar', () => ({
+  getProofByVideoHash: vi.fn().mockResolvedValue(null),
+}))
 
 describe('batchVerifier', () => {
   describe('computeChunkedSha256', () => {
@@ -1105,6 +1131,300 @@ describe('batchVerifier', () => {
       expect(verifier.cancelItem('non-existent-id')).toBe(false)
       expect(verifier.cancelItem(items[0].id)).toBe(false)
       expect(verifier.getItems()[0].status).toBe('confirmed')
+    })
+  })
+
+  describe('Batch Preflight Report (issue #1167)', () => {
+    describe('formatBytes', () => {
+      it('formats byte boundaries correctly', () => {
+        expect(formatBytes(0)).toBe('0 B')
+        expect(formatBytes(500)).toBe('500 B')
+        expect(formatBytes(1024)).toBe('1.0 KB')
+        expect(formatBytes(1048576)).toBe('1.0 MB')
+        expect(formatBytes(1572864)).toBe('1.5 MB')
+        expect(formatBytes(1073741824)).toBe('1.0 GB')
+      })
+    })
+
+    describe('isSupportedFormat', () => {
+      it('accepts supported video formats and JSON receipts', () => {
+        expect(isSupportedFormat({ name: 'evidence.mp4' }).isSupported).toBe(true)
+        expect(isSupportedFormat({ name: 'clip.MOV' }).isSupported).toBe(true)
+        expect(isSupportedFormat({ name: 'capture.webm' }).isSupported).toBe(true)
+        expect(isSupportedFormat({ name: 'scene.mkv' }).isSupported).toBe(true)
+        expect(isSupportedFormat({ name: 'record.avi' }).isSupported).toBe(true)
+        expect(isSupportedFormat({ name: 'receipt.json' }).isSupported).toBe(true)
+        expect(isSupportedFormat({ name: 'custom', type: 'video/mp4' }).isSupported).toBe(true)
+        expect(isSupportedFormat({ name: 'custom', type: 'application/json' }).isSupported).toBe(true)
+      })
+
+      it('rejects unsupported extensions and formats with helpful reasons', () => {
+        const textResult = isSupportedFormat({ name: 'notes.txt', type: 'text/plain' })
+        expect(textResult.isSupported).toBe(false)
+        expect(textResult.reason).toContain("Unsupported format '.txt'")
+
+        const pdfResult = isSupportedFormat({ name: 'brief.pdf', type: 'application/pdf' })
+        expect(pdfResult.isSupported).toBe(false)
+
+        const exeResult = isSupportedFormat({ name: 'malware.exe' })
+        expect(exeResult.isSupported).toBe(false)
+      })
+    })
+
+    describe('runBatchPreflight', () => {
+      it('calculates totalBytes and detects duplicate inputs and unsupported formats', () => {
+        const f1 = new File(['video-one-data'], 'video1.mp4', { type: 'video/mp4' })
+        const f2 = new File(['video-one-data'], 'video1.mp4', { type: 'video/mp4' }) // Duplicate input
+        const f3 = new File(['doc'], 'notes.txt', { type: 'text/plain' }) // Unsupported format
+        const f4 = new File(['valid-two-data'], 'video2.webm', { type: 'video/webm' })
+
+        const report = runBatchPreflight([f1, f2, f3, f4])
+
+        expect(report.totalFiles).toBe(4)
+        expect(report.totalBytes).toBe(f1.size + f2.size + f3.size + f4.size)
+        expect(report.duplicateCount).toBe(1)
+        expect(report.duplicates[0].fileName).toBe('video1.mp4')
+        expect(report.duplicates[0].duplicateOf).toBe('video1.mp4')
+        expect(report.unsupportedCount).toBe(1)
+        expect(report.unsupported[0].fileName).toBe('notes.txt')
+        expect(report.validCount).toBe(2) // f1 and f4
+        expect(report.hasIssues).toBe(true)
+        expect(report.canProceed).toBe(true)
+      })
+
+      it('handles boundary case: empty file batch', () => {
+        const report = runBatchPreflight([])
+        expect(report.totalFiles).toBe(0)
+        expect(report.totalBytes).toBe(0)
+        expect(report.validCount).toBe(0)
+        expect(report.duplicateCount).toBe(0)
+        expect(report.unsupportedCount).toBe(0)
+        expect(report.oversizedCount).toBe(0)
+        expect(report.hasIssues).toBe(false)
+        expect(report.canProceed).toBe(false)
+      })
+
+      it('handles boundary case: files exceeding size limits', () => {
+        const small = new File(['small'], 'small.mp4')
+        const large = new File(['a'.repeat(500)], 'huge.mp4')
+
+        const report = runBatchPreflight([small, large], { maxFileSizeBytes: 100 })
+        expect(report.oversizedCount).toBe(1)
+        expect(report.oversized[0].fileName).toBe('huge.mp4')
+        expect(report.validCount).toBe(1)
+      })
+    })
+
+    describe('Verifier execution guarantees', () => {
+      it('completes preflight first and does NOT hash or prove unsupported or duplicate input items', async () => {
+        const verifier = new BatchVerifier()
+        const fValid = new File(['valid video content'], 'valid.mp4', { type: 'video/mp4' })
+        const fDup = new File(['valid video content'], 'valid.mp4', { type: 'video/mp4' })
+        const fUnsup = new File(['unsupported binary'], 'unsupported.bin', { type: 'application/octet-stream' })
+
+        const { items, summary, preflight } = await verifier.runBatch([fValid, fDup, fUnsup])
+
+        // Verify preflight report was generated
+        expect(preflight).toBeDefined()
+        expect(preflight.totalFiles).toBe(3)
+        expect(preflight.duplicateCount).toBe(1)
+        expect(preflight.unsupportedCount).toBe(1)
+        expect(preflight.validCount).toBe(1)
+
+        // Verify items terminal statuses
+        const dupItem = items.find((i) => i.id !== items[0].id && i.fileName === 'valid.mp4')
+        expect(dupItem?.status).toBe('duplicate')
+        expect(dupItem?.videoHash).toBeNull() // NO hashing was performed on duplicate input
+
+        const unsupItem = items.find((i) => i.fileName === 'unsupported.bin')
+        expect(unsupItem?.status).toBe('unsupported')
+        expect(unsupItem?.videoHash).toBeNull() // NO hashing was performed on unsupported file
+        expect(unsupItem?.message).toContain("Unsupported format '.bin'")
+
+        // Summary assertions
+        expect(summary.totalFiles).toBe(3)
+        expect(summary.duplicates).toBe(1)
+        expect(summary.unsupported).toBe(1)
+      })
+    })
+  })
+
+  describe('Resumable Checkpoints', () => {
+    it('computes nonsecret file fingerprints sensitive to content changes', async () => {
+      const f1 = new File(['alpha payload'], 'clip.mp4', { type: 'video/mp4', lastModified: 1700000000000 })
+      const f2 = new File(['omega payload'], 'clip.mp4', { type: 'video/mp4', lastModified: 1700000000000 })
+
+      const fp1 = await computeFileFingerprint(f1, 0)
+      const fp2 = await computeFileFingerprint(f2, 0)
+
+      expect(fp1.fileName).toBe('clip.mp4')
+      expect(fp1.fileSizeBytes).toBe(f1.size)
+      expect(fp1.sampleHash).toMatch(/^[0-9a-f]{64}$/)
+      expect(fp1.sampleHash).not.toBe(fp2.sampleHash)
+    })
+
+    it('resumes a cancelled batch without re-verifying completed items and persists no secrets', async () => {
+      const fetchMock = vi.fn().mockImplementation((url: string) => {
+        if (url.includes('/api/stego/extract')) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ metadata: { protocol: 'harpocrates' } }),
+          })
+        }
+        if (url.includes('/api/proofs/by-video/')) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ events: [] }),
+          })
+        }
+        return Promise.reject(new Error('Unknown url'))
+      })
+      vi.stubGlobal('fetch', fetchMock)
+
+      const config: Partial<BatchConfig> = {
+        maxConcurrency: 1,
+        maxFileSizeBytes: 1024 * 1024,
+        maxTotalSizeBytes: 5 * 1024 * 1024,
+        apiBase: 'http://127.0.0.1:5050',
+        contractId: '',
+        network: 'testnet',
+        wallet: 'GSECRETWALLETADDRESS',
+      }
+
+      const f1 = new File(['synthetic-media-one'], 'one.mp4', { type: 'video/mp4', lastModified: 1000 })
+      const f2 = new File(['synthetic-media-two'], 'two.mp4', { type: 'video/mp4', lastModified: 2000 })
+
+      const verifier1 = new BatchVerifier(config)
+      let savedCheckpoint: BatchVerificationCheckpoint | null = null
+
+      const firstRun = await verifier1.runBatch([f1, f2], undefined, {
+        onCheckpoint: (cp) => {
+          savedCheckpoint = cp
+          if (cp.completed.length === 1) {
+            verifier1.cancel()
+          }
+        },
+      })
+
+      expect(firstRun.items[0].status).not.toBe('pending')
+      expect(firstRun.items[0].status).not.toBe('cancelled')
+      expect(firstRun.items[1].status).toBe('cancelled')
+      expect(savedCheckpoint).not.toBeNull()
+      expect(savedCheckpoint!.completed).toHaveLength(1)
+      expect(savedCheckpoint!.completed[0].index).toBe(0)
+
+      // Checkpoint must persist only nonsecret fingerprints & completed results
+      const serialized = JSON.stringify(savedCheckpoint)
+      expect(serialized).not.toContain('synthetic-media-one')
+      expect(serialized).not.toContain('synthetic-media-two')
+      expect(serialized).not.toContain('GSECRETWALLETADDRESS')
+
+      const callsAfterFirstRun = fetchMock.mock.calls.length
+
+      // Resume with a fresh verifier instance using the exact same files & context
+      const verifier2 = new BatchVerifier(config)
+      const resumed = await verifier2.resumeBatch([f1, f2], savedCheckpoint!)
+
+      expect(resumed.items[0].status).toBe(firstRun.items[0].status)
+      expect(resumed.items[1].status).not.toBe('cancelled')
+      expect(resumed.items[1].status).not.toBe('pending')
+      expect(resumed.checkpoint.completed).toHaveLength(2)
+
+      // Only the second file should have triggered network calls
+      const callsDuringResume = fetchMock.mock.calls.length - callsAfterFirstRun
+      expect(callsDuringResume).toBe(callsAfterFirstRun)
+
+      vi.unstubAllGlobals()
+    })
+
+    it('rejects resume when input files, policy, or network context no longer match', async () => {
+      const config: Partial<BatchConfig> = {
+        maxConcurrency: 1,
+        maxFileSizeBytes: 1024,
+        maxTotalSizeBytes: 4096,
+        apiBase: 'http://127.0.0.1:5050',
+        contractId: 'CTEST123',
+        network: 'testnet',
+      }
+
+      const f1 = new File(['payload-a'], 'a.mp4', { type: 'video/mp4', lastModified: 1000 })
+      const f2 = new File(['payload-b'], 'b.mp4', { type: 'video/mp4', lastModified: 2000 })
+
+      const fingerprints = await computeBatchFingerprints([f1, f2])
+      const verifier = new BatchVerifier(config)
+      const validCheckpoint: BatchVerificationCheckpoint = {
+        protocol: 'harpocrates-batch-checkpoint',
+        version: 1,
+        createdAt: '2026-11-19T00:00:00.000Z',
+        updatedAt: '2026-11-19T00:00:00.000Z',
+        policy: { maxFileSizeBytes: 1024, maxTotalSizeBytes: 4096 },
+        networkContext: { apiBase: 'http://127.0.0.1:5050', contractId: 'CTEST123', network: 'testnet' },
+        files: fingerprints,
+        completed: [],
+      }
+
+      // 1. Modified file content
+      const f2Modified = new File(['payload-x'], 'b.mp4', { type: 'video/mp4', lastModified: 2000 })
+      await expect(verifier.resumeBatch([f1, f2Modified], validCheckpoint)).rejects.toMatchObject({
+        name: 'BatchCheckpointError',
+        reason: 'files-mismatch',
+      })
+
+      // 2. Reordered files
+      await expect(verifier.resumeBatch([f2, f1], validCheckpoint)).rejects.toMatchObject({
+        name: 'BatchCheckpointError',
+        reason: 'files-mismatch',
+      })
+
+      // 3. Policy mismatch
+      const policyVerifier = new BatchVerifier({ ...config, maxFileSizeBytes: 2048 })
+      await expect(policyVerifier.resumeBatch([f1, f2], validCheckpoint)).rejects.toMatchObject({
+        name: 'BatchCheckpointError',
+        reason: 'policy-mismatch',
+      })
+
+      // 4. Network context mismatch (contractId, apiBase, or network)
+      const networkVerifier = new BatchVerifier({ ...config, network: 'mainnet' })
+      await expect(networkVerifier.resumeBatch([f1, f2], validCheckpoint)).rejects.toMatchObject({
+        name: 'BatchCheckpointError',
+        reason: 'network-mismatch',
+      })
+
+      const contractVerifier = new BatchVerifier({ ...config, contractId: 'COTHER999' })
+      await expect(contractVerifier.resumeBatch([f1, f2], validCheckpoint)).rejects.toMatchObject({
+        name: 'BatchCheckpointError',
+        reason: 'network-mismatch',
+      })
+
+      // 5. Invalid completed status (e.g. 'cancelled' injected into completed)
+      const invalidStatusCheckpoint = {
+        ...validCheckpoint,
+        completed: [
+          {
+            index: 0,
+            fileName: 'a.mp4',
+            fileSizeBytes: f1.size,
+            status: 'cancelled' as const,
+            videoHash: null,
+            metadataHash: null,
+            sourceHash: null,
+            tier: null,
+            chainStatus: null,
+            message: 'Cancelled',
+            duplicateOf: null,
+            failureReason: null,
+            durationMs: 1,
+          },
+        ],
+      }
+      const validation = validateBatchCheckpoint(invalidStatusCheckpoint, fingerprints, verifier.getConfig())
+      expect(validation.ok).toBe(false)
+      if (!validation.ok) {
+        expect(validation.reason).toBe('invalid-format')
+      }
+      await expect(verifier.resumeBatch([f1, f2], invalidStatusCheckpoint)).rejects.toBeInstanceOf(
+        BatchCheckpointError,
+      )
     })
   })
 })

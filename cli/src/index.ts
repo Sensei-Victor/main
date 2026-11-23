@@ -86,6 +86,7 @@ export {
   runCompareTrustPolicy,
   PolicyParseError,
 } from './compare-trust-policy.js'
+
 export type {
   TrustPolicy,
   ReceiptDecision,
@@ -95,16 +96,25 @@ export type {
   TrustPolicyComparisonReport,
   RunCompareTrustPolicyIo,
 } from './compare-trust-policy.js'
+
 export {
   checkCompatibility,
   formatCompatReport,
   runCheckCompat,
   COMPAT_EXIT_CODES,
 } from './compat.js'
+
+export {
+  compareReceipts,
+  formatComparisonResult,
+  parseReceiptInput,
+  normalizeReceipt,
+} from './compare-receipt.js'
 export type {
-  CompatConfig,
-  CompatCheckItem,
-  CompatReport,
-  CompatStatus,
-  RunCheckCompatIo,
-} from './compat.js'
+  ReceiptCategory,
+  ReceiptDifference,
+  ReceiptComparisonResult,
+  NormalizedCanonicalStatement,
+  NormalizedTrustProperties,
+  NormalizedReceipt,
+} from './compare-receipt.js'

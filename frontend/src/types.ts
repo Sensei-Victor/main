@@ -45,6 +45,7 @@ export type ProofPackage = {
   tier: IdentityTier
   silentWitness?: SilentWitnessProof
   timeAttestation?: TimeAttestation
+  evidenceNotes?: string
 }
 
 export type ProofEvent = {

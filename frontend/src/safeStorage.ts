@@ -12,9 +12,58 @@ export type PersistedUiPreferences = {
   vaultRecoveryRehearsed?: boolean
 }
 
-const STORAGE_KEY = 'harpocrates:ui-preferences'
+export const STORAGE_KEY = 'harpocrates:ui-preferences'
+export const VAULT_STORAGE_KEY = 'harpocrates:credential-vault'
 const VIEWS = new Set(['landing', 'studio', 'verify'])
 const TIERS = new Set(['silent', 'source', 'seal'])
+
+export interface CrossTabStorageChangeEvent {
+  key: string | null
+  oldValue: string | null
+  newValue: string | null
+  storageArea: Storage | null
+}
+
+export type CrossTabStorageListener = (change: CrossTabStorageChangeEvent) => void
+
+/**
+ * Register a cross-tab storage change listener.
+ * In web browsers, window fires a 'storage' event when another tab or window
+ * modifies localStorage.
+ *
+ * Handles both key-specific events and storage-wide clear events (where event.key is null).
+ * Returns an unregister cleanup function.
+ */
+export function addCrossTabStorageListener(
+  targetKey: string,
+  listener: CrossTabStorageListener,
+): () => void {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+    return () => {}
+  }
+
+  const handler = (event: StorageEvent) => {
+    // If event.storageArea is present, ensure it targets localStorage
+    if (event.storageArea && event.storageArea !== window.localStorage) {
+      return
+    }
+
+    // Match exact key or storage-wide clear event (where key is null)
+    if (event.key === targetKey || event.key === null) {
+      listener({
+        key: event.key,
+        oldValue: event.oldValue,
+        newValue: event.newValue,
+        storageArea: event.storageArea,
+      })
+    }
+  }
+
+  window.addEventListener('storage', handler)
+  return () => {
+    window.removeEventListener('storage', handler)
+  }
+}
 
 /**
  * The only application data permitted in browser storage is:
@@ -125,6 +174,10 @@ export function createSafeStorage(target: StorageTarget) {
 
     clearUiPreferences() {
       getStorage().removeItem(STORAGE_KEY)
+    },
+
+    onKeyChange(key: string, listener: CrossTabStorageListener): () => void {
+      return addCrossTabStorageListener(key, listener)
     },
   }
 }

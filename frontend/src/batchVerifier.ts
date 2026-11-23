@@ -16,6 +16,7 @@ export type BatchOutcome =
   | 'malformed'
   | 'oversized'
   | 'duplicate'
+  | 'unsupported'
   | 'error'
   | 'unavailable'
   | 'cancelled'
@@ -59,6 +60,85 @@ export type BatchConfig = {
   contractId: string
   wallet?: string
   network?: string
+}
+
+export const BATCH_CHECKPOINT_PROTOCOL = 'harpocrates-batch-checkpoint' as const
+export const BATCH_CHECKPOINT_VERSION = 1 as const
+
+export type BatchFileFingerprint = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  lastModified: number
+  mimeType: string
+  sampleHash: string
+}
+
+export type BatchCheckpointPolicy = {
+  maxFileSizeBytes: number
+  maxTotalSizeBytes: number
+}
+
+export type BatchCheckpointNetworkContext = {
+  apiBase: string
+  contractId: string
+  network: string
+}
+
+export type BatchCheckpointCompletedItem = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  status: BatchOutcome
+  videoHash: string | null
+  metadataHash: string | null
+  sourceHash: string | null
+  tier: string | null
+  chainStatus: string | null
+  message: string
+  duplicateOf: string | null
+  failureReason: string | null
+  durationMs: number | null
+}
+
+export type BatchVerificationCheckpoint = {
+  protocol: typeof BATCH_CHECKPOINT_PROTOCOL
+  version: typeof BATCH_CHECKPOINT_VERSION
+  createdAt: string
+  updatedAt: string
+  policy: BatchCheckpointPolicy
+  networkContext: BatchCheckpointNetworkContext
+  files: BatchFileFingerprint[]
+  completed: BatchCheckpointCompletedItem[]
+}
+
+export type CheckpointMismatchReason =
+  | 'invalid-format'
+  | 'policy-mismatch'
+  | 'network-mismatch'
+  | 'files-mismatch'
+
+export type CheckpointValidationResult =
+  | { ok: true }
+  | {
+      ok: false
+      reason: CheckpointMismatchReason
+      message: string
+    }
+
+export class BatchCheckpointError extends Error {
+  public readonly reason: CheckpointMismatchReason
+
+  constructor(reason: CheckpointMismatchReason, message: string) {
+    super(message)
+    this.name = 'BatchCheckpointError'
+    this.reason = reason
+  }
+}
+
+export type BatchRunOptions = {
+  checkpoint?: BatchVerificationCheckpoint
+  onCheckpoint?: (checkpoint: BatchVerificationCheckpoint) => void
 }
 
 export const BATCH_CHECKPOINT_PROTOCOL = 'harpocrates-batch-checkpoint' as const
@@ -280,6 +360,7 @@ export type BatchSummary = {
   unconfirmed: number
   manifests: number
   duplicates: number
+  unsupported: number
   errors: number
   cancelled: number
   verified: number
@@ -287,6 +368,211 @@ export type BatchSummary = {
   failed: number
   totalBytes: number
   durationMs: number
+}
+
+export type PreflightDuplicateItem = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  duplicateOf: string
+  reason: string
+}
+
+export type PreflightUnsupportedItem = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  mimeType: string
+  extension: string
+  reason: string
+}
+
+export type PreflightOversizedItem = {
+  index: number
+  fileName: string
+  fileSizeBytes: number
+  maxAllowedBytes: number
+  reason: string
+}
+
+export type BatchPreflightReport = {
+  totalFiles: number
+  totalBytes: number
+  validCount: number
+  duplicateCount: number
+  unsupportedCount: number
+  oversizedCount: number
+  duplicates: PreflightDuplicateItem[]
+  unsupported: PreflightUnsupportedItem[]
+  oversized: PreflightOversizedItem[]
+  hasIssues: boolean
+  canProceed: boolean
+  completedAt: string
+}
+
+export const SUPPORTED_VIDEO_EXTENSIONS = ['.mp4', '.mov', '.webm', '.mkv', '.avi'] as const
+export const SUPPORTED_MANIFEST_EXTENSIONS = ['.json'] as const
+
+/**
+ * Checks if a file is supported based on its file extension and MIME type.
+ */
+export function isSupportedFormat(file: { name: string; type?: string }): {
+  isSupported: boolean
+  extension: string
+  mimeType: string
+  reason?: string
+} {
+  const name = file.name || ''
+  const dotIndex = name.lastIndexOf('.')
+  const extension = dotIndex !== -1 ? name.slice(dotIndex).toLowerCase() : ''
+  const mimeType = (file.type || '').toLowerCase()
+
+  const isVideoExt = (SUPPORTED_VIDEO_EXTENSIONS as readonly string[]).includes(extension)
+  const isManifestExt = (SUPPORTED_MANIFEST_EXTENSIONS as readonly string[]).includes(extension)
+  const isVideoMime = mimeType.startsWith('video/')
+  const isJsonMime = mimeType === 'application/json'
+
+  const isSupported = isVideoExt || isManifestExt || isVideoMime || isJsonMime
+
+  if (!isSupported) {
+    return {
+      isSupported: false,
+      extension,
+      mimeType,
+      reason: `Unsupported format '${extension || mimeType || 'unknown'}'. Harpocrates accepts MP4, MOV, WEBM, MKV, AVI videos or JSON proof manifests.`,
+    }
+  }
+
+  return {
+    isSupported: true,
+    extension,
+    mimeType,
+  }
+}
+
+/**
+ * Formats a raw byte count into human-readable metric string.
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const val = bytes / Math.pow(1024, i)
+  return `${val.toFixed(val >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+/**
+ * Fast inspection of batch candidates before expensive hashing or proving.
+ * Reports duplicate inputs, total bytes, unsupported formats, and oversized files.
+ */
+export function runBatchPreflight(
+  files: File[],
+  config: Partial<BatchConfig> = {},
+): BatchPreflightReport {
+  const maxFileSizeBytes = config.maxFileSizeBytes ?? DEFAULT_BATCH_CONFIG.maxFileSizeBytes
+  const maxTotalSizeBytes = config.maxTotalSizeBytes ?? DEFAULT_BATCH_CONFIG.maxTotalSizeBytes
+
+  const duplicates: PreflightDuplicateItem[] = []
+  const unsupported: PreflightUnsupportedItem[] = []
+  const oversized: PreflightOversizedItem[] = []
+
+  let totalBytes = 0
+  let cumulativeBytes = 0
+
+  const seenByNameAndSize = new Map<string, string>()
+  const seenByName = new Map<string, string>()
+
+  const invalidIndices = new Set<number>()
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]
+    totalBytes += file.size
+
+    // 1. Format check
+    const formatCheck = isSupportedFormat(file)
+    if (!formatCheck.isSupported) {
+      invalidIndices.add(i)
+      unsupported.push({
+        index: i,
+        fileName: file.name,
+        fileSizeBytes: file.size,
+        mimeType: formatCheck.mimeType,
+        extension: formatCheck.extension,
+        reason: formatCheck.reason ?? `Unsupported format for '${file.name}'.`,
+      })
+    }
+
+    // 2. Duplicate inputs check (matched before hashing)
+    const nameKey = file.name.toLowerCase()
+    const sizeKey = `${nameKey}:${file.size}`
+    if (seenByNameAndSize.has(sizeKey)) {
+      invalidIndices.add(i)
+      const orig = seenByNameAndSize.get(sizeKey)!
+      duplicates.push({
+        index: i,
+        fileName: file.name,
+        fileSizeBytes: file.size,
+        duplicateOf: orig,
+        reason: `Duplicate input matching '${orig}' (${file.size} bytes).`,
+      })
+    } else if (seenByName.has(nameKey)) {
+      invalidIndices.add(i)
+      const orig = seenByName.get(nameKey)!
+      duplicates.push({
+        index: i,
+        fileName: file.name,
+        fileSizeBytes: file.size,
+        duplicateOf: orig,
+        reason: `Duplicate input file name matching '${orig}'.`,
+      })
+    } else {
+      seenByNameAndSize.set(sizeKey, file.name)
+      seenByName.set(nameKey, file.name)
+    }
+
+    // 3. Size check
+    if (file.size > maxFileSizeBytes) {
+      invalidIndices.add(i)
+      const limitMb = Math.round(maxFileSizeBytes / (1024 * 1024))
+      const fileMb = (file.size / (1024 * 1024)).toFixed(1)
+      oversized.push({
+        index: i,
+        fileName: file.name,
+        fileSizeBytes: file.size,
+        maxAllowedBytes: maxFileSizeBytes,
+        reason: `File exceeds size limit (${fileMb}MB > ${limitMb}MB limit).`,
+      })
+    } else if (cumulativeBytes + file.size > maxTotalSizeBytes) {
+      invalidIndices.add(i)
+      const totalLimitMb = Math.round(maxTotalSizeBytes / (1024 * 1024))
+      oversized.push({
+        index: i,
+        fileName: file.name,
+        fileSizeBytes: file.size,
+        maxAllowedBytes: maxTotalSizeBytes,
+        reason: `Total batch size limit exceeded (${totalLimitMb}MB max).`,
+      })
+    } else {
+      cumulativeBytes += file.size
+    }
+  }
+
+  const validCount = files.length - invalidIndices.size
+
+  return {
+    totalFiles: files.length,
+    totalBytes,
+    validCount,
+    duplicateCount: duplicates.length,
+    unsupportedCount: unsupported.length,
+    oversizedCount: oversized.length,
+    duplicates,
+    unsupported,
+    oversized,
+    hasIssues: duplicates.length > 0 || unsupported.length > 0 || oversized.length > 0,
+    canProceed: validCount > 0,
+    completedAt: new Date().toISOString(),
+  }
 }
 
 export const DEFAULT_BATCH_CONFIG: BatchConfig = {
@@ -760,38 +1046,6 @@ export class BatchVerifier {
     this.notifyProgress(true, true)
   }
 
-  /**
-   * Cancels a single queued (`pending`) or active (`hashing` / `processing`) item
-   * without stopping unrelated items in the batch.
-   * Returns true if the item was cancelled, or false if not found or already terminal.
-   */
-  public cancelItem(itemId: string): boolean {
-    const item = this.items.find((entry) => entry.id === itemId)
-    if (!item) {
-      return false
-    }
-    if (item.status !== 'pending' && item.status !== 'hashing' && item.status !== 'processing') {
-      return false
-    }
-
-    this.cancelledItemIds.add(itemId)
-    const itemController = this.itemAbortControllers.get(itemId)
-    if (itemController && !itemController.signal.aborted) {
-      itemController.abort()
-    }
-
-    if (item.videoHash && this.processedHashes.get(item.videoHash) === item.id) {
-      this.processedHashes.delete(item.videoHash)
-    }
-
-    item.status = 'cancelled'
-    item.message = 'Cancelled by user.'
-    item.failureReason = 'Item verification was cancelled by user request.'
-
-    this.notifyProgress(this.abortController?.signal.aborted ?? false, false)
-    return true
-  }
-
   public async resumeBatch(
     files: File[],
     checkpoint: BatchVerificationCheckpoint,
@@ -888,9 +1142,32 @@ export class BatchVerifier {
         durationMs: null,
         failureReason: null,
       }
+
+      // Check preflight flags upfront before any worker or hashing
+      if (unsupMap.has(idx)) {
+        const u = unsupMap.get(idx)!
+        item.status = 'unsupported'
+        item.message = u.reason
+        item.failureReason = u.reason
+      } else if (dupMap.has(idx)) {
+        const d = dupMap.get(idx)!
+        item.status = 'duplicate'
+        item.duplicateOf = d.duplicateOf
+        item.message = d.reason
+        item.failureReason = d.reason
+      } else if (overMap.has(idx)) {
+        const o = overMap.get(idx)!
+        item.status = 'oversized'
+        item.message = o.reason
+        item.failureReason = o.reason
+      }
+
+      return item
     })
 
-    this.items = orderBatchResults(initialItems)
+    this.accumulatedTotalBytes = this.items
+      .filter((i) => i.status === 'pending')
+      .reduce((sum, i) => sum + i.fileSizeBytes, 0)
 
     this.notifyProgress(false, false)
 
@@ -927,7 +1204,7 @@ export class BatchVerifier {
     this.accumulatedTotalBytes = currentBatchBytes
     this.notifyProgress(false, false)
 
-    // Execute with bounded concurrency while writing back to fixed input slots
+    // Execute with bounded concurrency
     const queue = this.items.filter((item) => item.status === 'pending')
     const concurrency = Math.max(1, Math.min(8, this.config.maxConcurrency))
 
@@ -940,24 +1217,9 @@ export class BatchVerifier {
           continue
         }
 
-        const itemController = new AbortController()
-        this.itemAbortControllers.set(item.id, itemController)
-        const onBatchAbort = () => itemController.abort()
-        if (signal.aborted) {
-          itemController.abort()
-        } else {
-          signal.addEventListener('abort', onBatchAbort, { once: true })
-        }
-
-        try {
-          await this.processItem(item, itemController.signal)
-        } finally {
-          signal.removeEventListener('abort', onBatchAbort)
-          this.itemAbortControllers.delete(item.id)
-        }
-
+        await this.processItem(item, signal)
         this.emitCheckpoint()
-        this.notifyProgress(signal.aborted, false)
+        this.notifyProgress(false, queue.length === 0)
       }
     }
 
@@ -1140,6 +1402,7 @@ export class BatchVerifier {
       unconfirmed: 0,
       manifests: 0,
       duplicates: 0,
+      unsupported: 0,
       errors: 0,
       cancelled: 0,
       verified: 0,

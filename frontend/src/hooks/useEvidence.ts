@@ -9,7 +9,7 @@
  * docs/proof-worker.md).
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Building2, Fingerprint, KeyRound } from 'lucide-react'
 import type {
   IdentityTier,
@@ -28,11 +28,14 @@ import {
 import { hashFileInWorker } from '../workers/fileHashWorkerClient'
 import { appConfig } from '../config'
 import {
-  ApiClientError,
-  isAdmissionError,
-  toAdmissionReason,
-  isInvalidEvidenceError,
-} from '../services/apiError'
+  buildProofPreparationPreview,
+  PROOF_PREPARATION_VERIFIER_SCOPE,
+  type ProofPreparationPreviewResult,
+} from '../proofPreparationPreview'
+import {
+  classifyInterruptedSession,
+  type InterruptedUploadSession,
+} from '../interruptedUpload'
 
 export const TIERS = [
   {
@@ -56,7 +59,8 @@ export const TIERS = [
     icon: Building2,
     description:
       'Verified issuer account signs the evidence as an official source. The connected wallet must be registered by the admin first.',
-  },]
+  },
+]
 
 const CONTRACT_ID = appConfig.harpocratesRegistryId
 
@@ -75,25 +79,47 @@ const CANCELLED_MESSAGES: Record<Stage, string> = {
   cancelled: 'Request cancelled.',
 }
 
-export type NetworkMismatchRecoveryState = {
-  /** Human-readable name of the network required by the deployed contract (e.g. "Testnet"). */
-  requiredNetwork: string
-  /** Human-readable name of the wallet's currently reported network (e.g. "Mainnet"), or "Unavailable". */
-  currentWalletNetwork: string
-  /** Non-identifying explanation of the mismatch. */
-  reason: string
-  /** Actionable remediation guidance for switching networks. */
-  remediation: string
-  /** True while a fresh network and evidence-intent validation is in progress. */
-  isValidating: boolean
-  /** Snapshot of the evidence intent active when the mismatch was detected. */
-  intent: {
-    proofId: string
-    tier: IdentityTier
-    videoHash: string
-  } | null
-  /** Optional privacy-safe error message from the most recent re-validation attempt. */
-  validationError: string | null
+export type EvidenceReviewSnapshot = {
+  /** Selected identity tier being registered. */
+  tier: IdentityTier
+  /** Human-readable tier title (e.g. "Silent Witness"). */
+  tierTitle: string
+  /** Human-readable tier label (e.g. "Anonymous Credential"). */
+  tierLabel: string
+  /** Canonical SHA-256 hex digest of the public registration statement. */
+  statementDigest: string
+  /** Human-readable Stellar network name (e.g. "Testnet"). */
+  networkName: string
+  /** Canonical Stellar network passphrase. */
+  networkPassphrase: string
+  /** Proof identifiers bound to this review snapshot. */
+  proofId: string
+  videoHash: string
+  metadataHash: string
+  sourceHash: string
+}
+
+/**
+ * Compute a canonical, privacy-safe SHA-256 digest of the public registration
+ * statement. Private seeds, witness proofs, and raw media are never included.
+ */
+export async function computeStatementDigest(input: {
+  tier: IdentityTier
+  videoHash: string
+  metadataHash: string
+  proofId: string
+  networkPassphrase: string
+}): Promise<string> {
+  const { sha256 } = await import('../utils')
+  const canonical = JSON.stringify({
+    schema: 'harpocrates.evidence-review.v1',
+    tier: input.tier,
+    videoHash: input.videoHash,
+    metadataHash: input.metadataHash,
+    proofId: input.proofId,
+    network: input.networkPassphrase,
+  })
+  return sha256(canonical)
 }
 
 export type UseEvidenceReturn = {
@@ -110,6 +136,10 @@ export type UseEvidenceReturn = {
   setCredentialSeed: (v: string) => void
   nullifierSeed: string
   setNullifierSeed: (v: string) => void
+  /** Original user-entered notes associated with this evidence. */
+  evidenceNotes: string
+  /** Update user-entered notes without clobbering by stale server responses. */
+  setEvidenceNotes: (notes: string) => void
   message: string
   /** Read-only preview of the canonical proof inputs and policy version. */
   proofPreparation: ProofPreparationPreviewResult
@@ -122,18 +152,32 @@ export type UseEvidenceReturn = {
   /** Guided recovery state when the wallet network does not match the required contract network. */
   networkMismatchRecovery: NetworkMismatchRecoveryState | null
   isCancellable: boolean
-  admissionState: UploadAdmissionState | null
-  uploadErrorKind: UploadErrorKind
-  isRejectedUpload: boolean
-  isInvalidEvidence: boolean
+  /** Active pre-registration review snapshot, or null when closed/invalidated. */
+  review: EvidenceReviewSnapshot | null
+  /** Privacy-safe reason explaining why a previously opened review was invalidated. */
+  reviewInvalidatedReason: string | null
+  openReview: () => Promise<void>
+  closeReview: () => void
   handleEvidence: (nextFile: File | null) => Promise<void>
-  retryUpload: () => Promise<void>
-  registerProof: (wallet: string) => Promise<void>
-  /** Re-validate the wallet network and selected evidence intent before allowing registration to resume. */
-  revalidateNetworkMismatch: (wallet: string) => Promise<boolean>
+  registerProof: (wallet: string, grantor?: string) => Promise<void>
   cancelEvidence: () => void
   /** Cancel an in-flight Silent Witness proof generation (no-op if idle). */
   cancelProving: () => void
+  /**
+   * Classification of the most-recently interrupted upload session.
+   * `category === 'none'` means there is no interrupted session to show.
+   */
+  interruptedSession: InterruptedUploadSession
+  /**
+   * Re-submit the interrupted file through the full evidence pipeline.
+   * No-op when `interruptedSession.category !== 'resumable'`.
+   */
+  resumeEvidence: () => Promise<void>
+  /**
+   * Clear the interrupted session without retrying.
+   * Resets stage back to `'idle'` and forgets the interrupted file.
+   */
+  discardEvidence: () => void
 }
 
 type PendingRegistration = {
@@ -143,27 +187,48 @@ type PendingRegistration = {
   wallet: string
 }
 
+type ReviewFingerprint = {
+  file: File | null
+  proofId: string
+  tier: IdentityTier
+  credentialSeed: string
+  nullifierSeed: string
+}
+
 export function useEvidence(): UseEvidenceReturn {
-  const [selectedTier, setSelectedTier] = useState<IdentityTier>('silent')
+  const [selectedTier, setSelectedTierState] = useState<IdentityTier>('silent')
   const [stage, setStage] = useState<Stage>('idle')
   const [hashProgress, setHashProgress] = useState<HashProgress | null>(null)
   const [file, setFile] = useState<File | null>(null)
   const [proof, setProof] = useState<ProofPackage | null>(null)
   const [processedVideoUrl, setProcessedVideoUrl] = useState<string>('')
-  const [credentialSeed, setCredentialSeed] = useState<string>('')
-  const [nullifierSeed, setNullifierSeed] = useState<string>('')
+  const [credentialSeed, setCredentialSeedState] = useState<string>('')
+  const [nullifierSeed, setNullifierSeedState] = useState<string>('')
   const [message, setMessage] = useState<string>('Upload evidence to begin.')
-  const [evidenceChangeNotice, setEvidenceChangeNotice] = useState<string | null>(null)
+  const [evidenceNotes, setEvidenceNotesState] = useState<string>('')
+  const evidenceNotesRef = useRef<string>('')
+  const notesEditSeqRef = useRef<number>(0)
+  const reviewedFileRef = useRef<{
+    file: File
+    name: string
+    size: number
+    lastModified: number
+  } | null>(null)
   const [registration, setRegistration] = useState<RegisterProofResult | null>(null)
   const [networkMismatch, setNetworkMismatch] = useState<string | null>(null)
-  const [admissionState, setAdmissionState] = useState<UploadAdmissionState | null>(null)
-  const [uploadErrorKind, setUploadErrorKind] = useState<UploadErrorKind>('none')
+  const [review, setReview] = useState<EvidenceReviewSnapshot | null>(null)
+  const [reviewInvalidatedReason, setReviewInvalidatedReason] = useState<string | null>(null)
   // Keep retries safe: a completed proof/wallet pair must never be submitted twice.
   const registrationInFlightedRef = useRef<boolean>(false)
   const completedRegistrationRef = useRef<string | null>(null)
   const pendingPersistenceRef = useRef<PendingRegistration | null>(null)
   const processedVideoUrlRef = useRef<string>('')
   const hasSelectedEvidenceRef = useRef<boolean>(false)
+
+  // Review state refs for synchronous invalidation and fail-closed registration checks.
+  const reviewRef = useRef<EvidenceReviewSnapshot | null>(null)
+  const reviewFingerprintRef = useRef<ReviewFingerprint | null>(null)
+  const reviewSeqRef = useRef<number>(0)
 
   // Sequence guard + abort plumbing so stale uploads/proofs cannot clobber a
   // newer flow or a reset caused by cancellation.
@@ -183,6 +248,12 @@ export function useEvidence(): UseEvidenceReturn {
     lastModified: number
     digest: string
   } | null>(null)
+
+  // Interrupted-upload recovery: track the file and timestamp of the most
+  // recently interrupted session so the RecoveryBanner can classify it.
+  // Stored in state (not refs) so that updates trigger a re-render of the banner.
+  const [interruptedFile, setInterruptedFile] = useState<File | null>(null)
+  const [interruptedAt, setInterruptedAt] = useState<number | null>(null)
 
   useEffect(() => {
     stageRef.current = stage
@@ -229,19 +300,95 @@ export function useEvidence(): UseEvidenceReturn {
 
   const isCancellable = stage === 'hashing' || stage === 'embedding' || stage === 'proving'
 
-  function clearProcessedVideoUrl() {
-    if (processedVideoUrlRef.current) {
-      URL.revokeObjectURL(processedVideoUrlRef.current)
-      processedVideoUrlRef.current = ''
-    }
-    setProcessedVideoUrl('')
+  function clearReviewState() {
+    reviewSeqRef.current += 1
+    reviewRef.current = null
+    reviewFingerprintRef.current = null
+    setReview(null)
+    setReviewInvalidatedReason(null)
   }
 
-  function clearEvidenceChangeNotice() {
-    setEvidenceChangeNotice(null)
+  function invalidateReview(reason: string) {
+    reviewSeqRef.current += 1
+    const hadActiveReview = reviewRef.current !== null
+    reviewRef.current = null
+    reviewFingerprintRef.current = null
+    setReview(null)
+    if (hadActiveReview) {
+      setReviewInvalidatedReason(reason)
+      setMessage(reason)
+    }
+  }
+
+  function setSelectedTier(nextTier: IdentityTier) {
+    if (nextTier === selectedTier) return
+    setSelectedTierState(nextTier)
+    invalidateReview(
+      'Review invalidated because the identity tier changed. Review again before registering.',
+    )
+  }
+
+  function setCredentialSeed(value: string) {
+    if (value === credentialSeed) return
+    setCredentialSeedState(value)
+    invalidateReview(
+      'Review invalidated because proof parameters changed. Review again before registering.',
+    )
+  }
+
+  function setNullifierSeed(value: string) {
+    if (value === nullifierSeed) return
+    setNullifierSeedState(value)
+    invalidateReview(
+      'Review invalidated because proof parameters changed. Review again before registering.',
+    )
+  }
+
+  async function openReview() {
+    if (!proof || isCancellable) return
+    const reviewSeq = ++reviewSeqRef.current
+    const fingerprint: ReviewFingerprint = {
+      file,
+      proofId: proof.proofId,
+      tier: selectedTier,
+      credentialSeed,
+      nullifierSeed,
+    }
+    const { CONTRACT_NETWORK_PASSPHRASE } = await import('../stellar')
+    const { networkName } = await import('../networkGuard')
+    const statementDigest = await computeStatementDigest({
+      tier: selectedTier,
+      videoHash: proof.videoHash,
+      metadataHash: proof.metadataHash,
+      proofId: proof.proofId,
+      networkPassphrase: CONTRACT_NETWORK_PASSPHRASE,
+    })
+    if (reviewSeqRef.current !== reviewSeq) return
+    const snapshot: EvidenceReviewSnapshot = {
+      tier: selectedTier,
+      tierTitle: selectedTierMeta.title,
+      tierLabel: selectedTierMeta.label,
+      statementDigest,
+      networkName: networkName(CONTRACT_NETWORK_PASSPHRASE),
+      networkPassphrase: CONTRACT_NETWORK_PASSPHRASE,
+      proofId: proof.proofId,
+      videoHash: proof.videoHash,
+      metadataHash: proof.metadataHash,
+      sourceHash: proof.sourceHash,
+    }
+    reviewRef.current = snapshot
+    reviewFingerprintRef.current = fingerprint
+    setReview(snapshot)
+    setReviewInvalidatedReason(null)
+    setMessage('Review the evidence details below before registering on Stellar.')
+  }
+
+  function closeReview() {
+    clearReviewState()
   }
 
   function resetFlow() {
+    clearReviewState()
     abortRef.current?.abort()
     abortRef.current = null
     seqRef.current += 1
@@ -277,11 +424,22 @@ export function useEvidence(): UseEvidenceReturn {
     proofRequestIdRef.current = null
   }
 
+  const setEvidenceNotes = useCallback((notes: string) => {
+    notesEditSeqRef.current += 1
+    evidenceNotesRef.current = notes
+    setEvidenceNotesState(notes)
+  }, [])
+
   async function handleEvidence(nextFile: File | null) {
     if (!nextFile) return
 
-    setAdmissionState(null)
-    setUploadErrorKind('none')
+    if (reviewRef.current !== null) {
+      invalidateReview(
+        'Review invalidated because the source file changed. Review again before registering.',
+      )
+    } else {
+      clearReviewState()
+    }
 
     evidenceFlowAbortRef.current?.abort()
     const controller = new AbortController()
@@ -385,6 +543,7 @@ export function useEvidence(): UseEvidenceReturn {
         proofId,
         timestamp,
         tier: selectedTier,
+        evidenceNotes: evidenceNotesRef.current || undefined,
       })
       setAdmissionState({
         status: 'admitted',
@@ -399,6 +558,11 @@ export function useEvidence(): UseEvidenceReturn {
       setMessage('Embedded evidence package is ready for Stellar registration.')
     } catch (error) {
       if (!isCurrentFlow()) return
+      // Capture the interrupted file so the recovery banner can classify the
+      // session even when the interruption came from an error rather than
+      // explicit cancellation.
+      setInterruptedFile(nextFile)
+      setInterruptedAt(Date.now())
       setStage('error')
       const errorMessage = error instanceof Error ? error.message : 'Evidence processing failed.'
       setMessage(errorMessage)
@@ -431,8 +595,32 @@ export function useEvidence(): UseEvidenceReturn {
     }
   }
 
-  async function registerProof(wallet: string) {
+  async function registerProof(wallet: string, grantor?: string) {
     if (!proof) return
+
+    const activeReview = reviewRef.current
+    const fingerprint = reviewFingerprintRef.current
+    const reviewMatchesCurrentState =
+      activeReview !== null &&
+      fingerprint !== null &&
+      fingerprint.file === file &&
+      fingerprint.proofId === proof.proofId &&
+      fingerprint.tier === selectedTier &&
+      fingerprint.credentialSeed === credentialSeed &&
+      fingerprint.nullifierSeed === nullifierSeed
+
+    if (!reviewMatchesCurrentState) {
+      if (activeReview !== null) {
+        invalidateReview(
+          'Review invalidated because the source file or proof parameters changed. Review again before registering.',
+        )
+      } else {
+        setMessage(
+          reviewInvalidatedReason ?? 'Review the evidence package before registering.',
+        )
+      }
+      return
+    }
 
     if (!CONTRACT_ID) {
       setMessage('Set VITE_HARPOCRATES_REGISTRY_ID after deploying the Soroban contract.')
@@ -496,7 +684,10 @@ export function useEvidence(): UseEvidenceReturn {
       return
     }
 
-    const registrationKey = `${proof.proofId}:${wallet}`
+    const effectiveGrantor = grantor?.trim() ? grantor.trim() : undefined
+    const registrationKey = effectiveGrantor
+      ? `${proof.proofId}:${wallet}:${effectiveGrantor}`
+      : `${proof.proofId}:${wallet}`
     if (completedRegistrationRef.current === registrationKey) {
       setMessage('This proof has already been submitted by this wallet.')
       return
@@ -561,6 +752,7 @@ export function useEvidence(): UseEvidenceReturn {
       await persistRegistration(proofForRegistration, result, wallet)
       pendingPersistenceRef.current = null
       completedRegistrationRef.current = registrationKey
+      clearReviewState()
       setRegistration(result)
       setEvidenceChangeNotice(null)
       setStage('registered')
@@ -742,6 +934,11 @@ export function useEvidence(): UseEvidenceReturn {
     if (currentStage !== 'hashing' && currentStage !== 'embedding' && currentStage !== 'proving') {
       return
     }
+    // Capture the interrupted file and timestamp before resetting state so the
+    // recovery banner can classify the session after the user navigates away
+    // and returns to the studio.
+    setInterruptedFile(file)
+    setInterruptedAt(Date.now())
     evidenceFlowAbortRef.current?.abort()
     evidenceFlowAbortRef.current = null
     if (currentStage === 'proving') {
@@ -753,15 +950,54 @@ export function useEvidence(): UseEvidenceReturn {
     setMessage(CANCELLED_MESSAGES[currentStage])
   }
 
-  async function retryUpload() {
-    if (file) {
-      await handleEvidence(file)
-    }
+  // ---------------------------------------------------------------------------
+  // Interrupted-upload recovery
+  // ---------------------------------------------------------------------------
+
+  // Classify the current session on every render so the RecoveryBanner always
+  // reflects the latest state without needing a separate subscription.
+  const interruptedSession: InterruptedUploadSession = useMemo(
+    () =>
+      classifyInterruptedSession({
+        stage,
+        currentFile: file,
+        interruptedFile,
+        interruptedAt,
+        errorMessage: stage === 'error' ? message : null,
+      }),
+    [stage, file, interruptedFile, interruptedAt, message],
+  )
+
+  /**
+   * Re-submit the interrupted file through the full evidence pipeline.
+   *
+   * Guards:
+   * - Only acts when the session is classified as 'resumable'.
+   * - Prevents automatic retry when the user has picked a different source
+   *   file (source-changed guard is enforced by classifyInterruptedSession).
+   */
+  async function resumeEvidence(): Promise<void> {
+    if (interruptedSession.category !== 'resumable') return
+    const fileToResume = interruptedFile
+    if (!fileToResume) return
+    // Clear the interrupted session before starting so a new interruption
+    // during the resumed flow is tracked fresh.
+    setInterruptedFile(null)
+    setInterruptedAt(null)
+    await handleEvidence(fileToResume)
   }
 
-  const isRejectedUpload =
-    uploadErrorKind === 'admission_rejected' && admissionState?.status === 'rejected'
-  const isInvalidEvidence = uploadErrorKind === 'invalid_evidence'
+  /**
+   * Clear the interrupted session and return to 'idle' without retrying.
+   */
+  function discardEvidence(): void {
+    setInterruptedFile(null)
+    setInterruptedAt(null)
+    resetFlow()
+    setHashProgress(null)
+    setStage('idle')
+    setMessage('Upload evidence to begin.')
+  }
 
   return {
     selectedTier,
@@ -776,6 +1012,8 @@ export function useEvidence(): UseEvidenceReturn {
     setCredentialSeed,
     nullifierSeed,
     setNullifierSeed,
+    evidenceNotes,
+    setEvidenceNotes,
     message,
     proofPreparation,
     acknowledgedSensitiveFields,
@@ -784,15 +1022,18 @@ export function useEvidence(): UseEvidenceReturn {
     networkMismatch,
     networkMismatchRecovery,
     isCancellable,
-    admissionState,
-    uploadErrorKind,
-    isRejectedUpload,
-    isInvalidEvidence,
+    review,
+    reviewInvalidatedReason,
+    openReview,
+    closeReview,
     handleEvidence,
-    retryUpload,
+    retryEvidence,
     registerProof,
     revalidateNetworkMismatch,
     cancelEvidence,
     cancelProving,
+    interruptedSession,
+    resumeEvidence,
+    discardEvidence,
   }
 }

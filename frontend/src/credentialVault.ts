@@ -1,6 +1,13 @@
 import type { SeedPair } from './seedVault'
-import { createIsolatedStateContainer, createSafeStorage } from './safeStorage'
+import {
+  VAULT_STORAGE_KEY,
+  addCrossTabStorageListener,
+  type CrossTabStorageChangeEvent,
+} from './safeStorage'
 
+export { VAULT_STORAGE_KEY }
+
+const VAULT_VERSION = 1
 const PBKDF2_ITERATIONS = 600000
 const PBKDF2_HASH = 'SHA-256' as const
 const SALT_BYTES = 16
@@ -210,155 +217,29 @@ export interface VaultEnvelopeV2 {
   ct: string // hex (ciphertext)
 }
 
-export const VAULT_EXPORT_DESTINATIONS = ['file-download', 'encrypted-clipboard'] as const
-export type VaultExportDestination = (typeof VAULT_EXPORT_DESTINATIONS)[number]
+export type VaultStatus = 'locked' | 'unlocked' | 'stale'
 
-export interface VaultBackupCompatibilityMetadata {
-  envelopeVersion: number
-  compatible: boolean
-  compatibilityNote: string
-  kdf: 'PBKDF2-SHA256'
-  kdfIterations: number
-  cipher: 'AES-256-GCM'
-  saltBytes: number
-  ivBytes: number
-  ciphertextBytes: number
-  encryptedPayloadBytes: number
-  containsSecretsInPreview: false
+export type StaleReason = 'envelope-updated' | 'envelope-removed' | 'envelope-corrupted'
+
+export type RecoveryAction = 'reload' | 'overwrite' | 'discard'
+
+export interface PreservedActiveWork {
+  readonly seeds: SeedPair
+  readonly capturedAt: number
+  readonly staleReason: StaleReason
+  readonly customData?: unknown
 }
 
-export type VaultBackupPreviewErrorCode =
-  | 'NO_VAULT'
-  | 'CORRUPTED_ENVELOPE'
-  | 'UNSUPPORTED_VERSION'
-  | 'INVALID_ENVELOPE_FIELDS'
+export type VaultEvent =
+  | { type: 'stale'; reason: StaleReason; preservedWork: PreservedActiveWork }
+  | { type: 'recovered'; action: RecoveryAction }
+  | { type: 'locked' }
+  | { type: 'unlocked' }
 
-export type VaultBackupPreviewResult =
-  | {
-      ok: true
-      metadata: VaultBackupCompatibilityMetadata
-      requiresDestinationSelection: true
-    }
-  | {
-      ok: false
-      code: VaultBackupPreviewErrorCode
-      message: string
-      envelopeVersion?: number
-    }
+export type VaultEventListener = (event: VaultEvent) => void
 
-export type VaultExportErrorCode =
-  | VaultBackupPreviewErrorCode
-  | 'DESTINATION_REQUIRED'
-  | 'INVALID_DESTINATION'
-
-export type VaultExportResult =
-  | {
-      ok: true
-      destination: VaultExportDestination
-      serializedEnvelope: string
-      metadata: VaultBackupCompatibilityMetadata
-    }
-  | {
-      ok: false
-      code: VaultExportErrorCode
-      message: string
-    }
-
-const EVEN_HEX_RE = /^[0-9a-fA-F]+$/
-
-function isValidHexField(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length % 2 === 0 && EVEN_HEX_RE.test(value)
-}
-
-export function isVaultExportDestination(value: unknown): value is VaultExportDestination {
-  return (
-    typeof value === 'string' &&
-    (VAULT_EXPORT_DESTINATIONS as readonly string[]).includes(value)
-  )
-}
-
-/**
- * Builds a nonsecret backup export preview from a serialized `VaultEnvelope`.
- * Never decrypts or exposes `salt`, `iv`, `ct`, passphrases, or credential seeds.
- */
-export function buildVaultBackupPreview(rawEnvelope: string | null): VaultBackupPreviewResult {
-  if (!rawEnvelope) {
-    return {
-      ok: false,
-      code: 'NO_VAULT',
-      message: 'No encrypted credential vault is stored on this device.',
-    }
-  }
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(rawEnvelope)
-  } catch {
-    return {
-      ok: false,
-      code: 'CORRUPTED_ENVELOPE',
-      message: 'Vault corrupted: unable to parse envelope.',
-    }
-  }
-
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return {
-      ok: false,
-      code: 'CORRUPTED_ENVELOPE',
-      message: 'Vault corrupted: envelope must be a JSON object.',
-    }
-  }
-
-  const candidate = parsed as Record<string, unknown>
-  if (typeof candidate.v !== 'number' || !Number.isInteger(candidate.v)) {
-    return {
-      ok: false,
-      code: 'INVALID_ENVELOPE_FIELDS',
-      message: 'Vault envelope is missing a valid integer version.',
-    }
-  }
-
-  if (candidate.v !== VAULT_VERSION) {
-    return {
-      ok: false,
-      code: 'UNSUPPORTED_VERSION',
-      message: `Unsupported vault version: ${candidate.v}. Supported version: ${VAULT_VERSION}.`,
-      envelopeVersion: candidate.v,
-    }
-  }
-
-  if (
-    !isValidHexField(candidate.salt) ||
-    !isValidHexField(candidate.iv) ||
-    !isValidHexField(candidate.ct)
-  ) {
-    return {
-      ok: false,
-      code: 'INVALID_ENVELOPE_FIELDS',
-      message: 'Vault envelope contains missing or malformed encrypted fields.',
-      envelopeVersion: candidate.v,
-    }
-  }
-
-  const encryptedPayloadBytes = new TextEncoder().encode(rawEnvelope).byteLength
-
-  return {
-    ok: true,
-    requiresDestinationSelection: true,
-    metadata: {
-      envelopeVersion: candidate.v,
-      compatible: true,
-      compatibilityNote: `Compatible with Harpocrates Credential Vault v${VAULT_VERSION} (PBKDF2-SHA256 + AES-256-GCM).`,
-      kdf: 'PBKDF2-SHA256',
-      kdfIterations: PBKDF2_ITERATIONS,
-      cipher: 'AES-256-GCM',
-      saltBytes: candidate.salt.length / 2,
-      ivBytes: candidate.iv.length / 2,
-      ciphertextBytes: candidate.ct.length / 2,
-      encryptedPayloadBytes,
-      containsSecretsInPreview: false,
-    },
-  }
+export interface RecoveryOptions {
+  password?: string
 }
 
 function bufToHex(buffer: ArrayBuffer): string {
@@ -522,6 +403,14 @@ export class CredentialVault {
   private timeoutId: ReturnType<typeof setTimeout> | null = null
   private inactivityTimeoutMs: number
 
+  // Cross-tab change detection and active work recovery state
+  private currentEnvelopeRaw: string | null = null
+  private staleReason: StaleReason | null = null
+  private preservedWork: PreservedActiveWork | null = null
+  private customActiveWork: unknown = null
+  private unsubscribeStorage: (() => void) | null = null
+  private listeners: Set<VaultEventListener> = new Set()
+
   constructor(inactivityTimeoutMs = DEFAULT_TIMEOUT_MS) {
     this.inactivityTimeoutMs = inactivityTimeoutMs;
     // Listen for lock broadcasts from other tabs
@@ -540,13 +429,47 @@ export class CredentialVault {
     this.inactivityTimeoutMs = inactivityTimeoutMs;
   }
     this.inactivityTimeoutMs = inactivityTimeoutMs
+    this.initStorageListener()
   }
 
   isLocked(): boolean {
-    return this.memoryKey === null || this.seeds === null
+    return this.memoryKey === null || this.seeds === null || this.isStale()
+  }
+
+  isStale(): boolean {
+    return this.checkStaleness()
+  }
+
+  getStatus(): VaultStatus {
+    if (this.isStale()) return 'stale'
+    if (this.isLocked()) return 'locked'
+    return 'unlocked'
+  }
+
+  getStaleReason(): StaleReason | null {
+    return this.staleReason
+  }
+
+  hasPreservedWork(): boolean {
+    return this.preservedWork !== null
+  }
+
+  getPreservedWork(): PreservedActiveWork | null {
+    return this.preservedWork
+  }
+
+  setActiveWork(data: unknown): void {
+    this.customActiveWork = data
+  }
+
+  getActiveWork(): unknown {
+    return this.customActiveWork
   }
 
   getSeeds(): SeedPair | null {
+    if (this.isStale()) {
+      return null
+    }
     this.resetTimeout()
     return this.seeds
   }
@@ -603,6 +526,42 @@ export class CredentialVault {
     }
   }
 
+  checkStaleness(): boolean {
+    if (this.staleReason !== null) {
+      return true
+    }
+
+    // Only an unlocked session can become stale from external envelope modifications
+    if (this.memoryKey !== null && this.seeds !== null) {
+      const currentStored = window.localStorage.getItem(VAULT_STORAGE_KEY)
+      if (currentStored !== this.currentEnvelopeRaw) {
+        let reason: StaleReason = 'envelope-updated'
+        if (!currentStored) {
+          reason = 'envelope-removed'
+        } else {
+          try {
+            const parsed = JSON.parse(currentStored)
+            if (!parsed || typeof parsed !== 'object' || parsed.v !== VAULT_VERSION) {
+              reason = 'envelope-corrupted'
+            }
+          } catch {
+            reason = 'envelope-corrupted'
+          }
+        }
+        this.invalidateStaleView(reason)
+        return true
+      }
+    }
+    return false
+  }
+
+  subscribe(listener: VaultEventListener): () => void {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
+  }
+
   async setup(password: string, seeds: SeedPair): Promise<void> {
     const { key, serialized } = await encryptEnvelopeV2(password, seeds)
 
@@ -626,10 +585,14 @@ export class CredentialVault {
       ct: bufToHex(ct),
     }
 
-    this.storage.setItem(VAULT_STORAGE_KEY, JSON.stringify(envelope))
+    const envelopeJson = JSON.stringify(envelope)
+    window.localStorage.setItem(VAULT_STORAGE_KEY, envelopeJson)
+    this.currentEnvelopeRaw = envelopeJson
+    this.clearPreservedWork()
     this.memoryKey = key
     this.seeds = { credentialSeed: seeds.credentialSeed, nullifierSeed: seeds.nullifierSeed }
     this.resetTimeout()
+    this.notifyListeners({ type: 'unlocked' })
   }
 
   /**
@@ -722,6 +685,8 @@ export class CredentialVault {
       const dec = new TextDecoder()
       const seedsRaw = JSON.parse(dec.decode(pt))
       
+      this.currentEnvelopeRaw = stored
+      this.clearPreservedWork()
       this.memoryKey = key
       this.seeds = {
         credentialSeed: seedsRaw.credentialSeed,
@@ -738,6 +703,7 @@ export class CredentialVault {
       this.memoryKey = decrypted.key
       this.seeds = decrypted.seeds
       this.resetTimeout()
+      this.notifyListeners({ type: 'unlocked' })
       return true
     } catch (err) {
       if (err instanceof VaultDecryptionError) {
@@ -809,17 +775,186 @@ export class CredentialVault {
     zeroSeeds(this.seeds)
     this.seeds = null
     this.clearTimeout()
+    this.notifyListeners({ type: 'locked' })
+  }
+
+  async recover(action: 'reload', options?: RecoveryOptions): Promise<boolean>
+  async recover(action: 'overwrite', options: { password: string }): Promise<void>
+  async recover(action: 'discard'): Promise<void>
+  async recover(action: RecoveryAction, options?: RecoveryOptions): Promise<boolean | void> {
+    if (action === 'discard') {
+      this.clearPreservedWork()
+      this.currentEnvelopeRaw = window.localStorage.getItem(VAULT_STORAGE_KEY)
+      this.lock()
+      this.notifyListeners({ type: 'recovered', action: 'discard' })
+      return
+    }
+
+    if (action === 'reload') {
+      this.clearPreservedWork()
+      this.currentEnvelopeRaw = window.localStorage.getItem(VAULT_STORAGE_KEY)
+      this.lock()
+
+      let unlocked = false
+      if (options?.password) {
+        unlocked = await this.unlock(options.password)
+      }
+
+      this.notifyListeners({ type: 'recovered', action: 'reload' })
+      return unlocked
+    }
+
+    if (action === 'overwrite') {
+      if (!this.preservedWork?.seeds) {
+        throw new Error('No preserved active work available to overwrite vault')
+      }
+      if (!options?.password) {
+        throw new Error('Password required to overwrite vault envelope')
+      }
+
+      const seedsToPreserve: SeedPair = {
+        credentialSeed: this.preservedWork.seeds.credentialSeed,
+        nullifierSeed: this.preservedWork.seeds.nullifierSeed,
+      }
+
+      await this.setup(options.password, seedsToPreserve)
+      this.notifyListeners({ type: 'recovered', action: 'overwrite' })
+      return
+    }
+
+    throw new Error(`Unsupported recovery action: ${String(action)}`)
+  }
+
+  async handleRecoveryAction(action: RecoveryAction, options?: RecoveryOptions): Promise<boolean> {
+    if (action === 'reload') {
+      return await this.recover('reload', options)
+    }
+    if (action === 'overwrite') {
+      if (!options?.password) {
+        throw new Error('Password required to overwrite vault envelope')
+      }
+      await this.recover('overwrite', { password: options.password })
+      return true
+    }
+    if (action === 'discard') {
+      await this.recover('discard')
+      return true
+    }
+    throw new Error(`Unsupported recovery action: ${String(action)}`)
   }
 
   destroy(): void {
     this.lock()
-    this.storage.removeItem(VAULT_STORAGE_KEY)
+    this.clearPreservedWork()
+    this.currentEnvelopeRaw = null
+    window.localStorage.removeItem(VAULT_STORAGE_KEY)
+    if (this.unsubscribeStorage) {
+      this.unsubscribeStorage()
+      this.unsubscribeStorage = null
+    }
   }
 
-  async rehearseRecovery(
-    options?: VaultRecoveryRehearsalOptions
-  ): Promise<VaultRecoveryRehearsalResult> {
-    return rehearseVaultRecovery(options)
+  dispose(): void {
+    if (this.unsubscribeStorage) {
+      this.unsubscribeStorage()
+      this.unsubscribeStorage = null
+    }
+    this.clearTimeout()
+    this.listeners.clear()
+  }
+
+  private initStorageListener(): void {
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      this.unsubscribeStorage = addCrossTabStorageListener(
+        VAULT_STORAGE_KEY,
+        (change) => this.handleCrossTabStorageChange(change)
+      )
+    }
+  }
+
+  private handleCrossTabStorageChange(change: CrossTabStorageChangeEvent): void {
+    // If vault is not unlocked and not stale, just track stored value
+    if (this.isLocked() && !this.isStale()) {
+      this.currentEnvelopeRaw = change.newValue
+      return
+    }
+
+    // Already in stale recovery state
+    if (this.isStale()) {
+      return
+    }
+
+    const currentStored = window.localStorage.getItem(VAULT_STORAGE_KEY)
+    if (currentStored === this.currentEnvelopeRaw) {
+      return
+    }
+
+    let reason: StaleReason = 'envelope-updated'
+    if (!currentStored) {
+      reason = 'envelope-removed'
+    } else {
+      try {
+        const parsed = JSON.parse(currentStored)
+        if (!parsed || typeof parsed !== 'object' || parsed.v !== VAULT_VERSION) {
+          reason = 'envelope-corrupted'
+        }
+      } catch {
+        reason = 'envelope-corrupted'
+      }
+    }
+
+    this.invalidateStaleView(reason)
+  }
+
+  private invalidateStaleView(reason: StaleReason): void {
+    if (!this.seeds) return
+
+    // Quarantine and preserve active work before zeroing active session
+    this.preservedWork = {
+      seeds: {
+        credentialSeed: this.seeds.credentialSeed,
+        nullifierSeed: this.seeds.nullifierSeed,
+      },
+      capturedAt: Date.now(),
+      staleReason: reason,
+      customData: this.customActiveWork,
+    }
+
+    this.staleReason = reason
+
+    // Inactivity timeout must not silently discard preserved work
+    this.clearTimeout()
+
+    // Invalidate unlocked view and zero out active session references
+    this.seeds.credentialSeed = ''
+    this.seeds.nullifierSeed = ''
+    this.seeds = null
+    this.memoryKey = null
+
+    this.notifyListeners({
+      type: 'stale',
+      reason,
+      preservedWork: this.preservedWork,
+    })
+  }
+
+  private clearPreservedWork(): void {
+    if (this.preservedWork) {
+      this.preservedWork.seeds.credentialSeed = ''
+      this.preservedWork.seeds.nullifierSeed = ''
+      this.preservedWork = null
+    }
+    this.staleReason = null
+  }
+
+  private notifyListeners(event: VaultEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event)
+      } catch (err) {
+        console.error('CredentialVault listener error:', err)
+      }
+    }
   }
 
   private resetTimeout(): void {

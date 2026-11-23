@@ -1,138 +1,177 @@
 import { describe, expect, it } from 'vitest'
 import {
-  resolveVerifiedStatementIdentity,
-  shouldResetDependentTabState,
+  buildVerificationExportPreview,
+  evaluateVerificationFreshness,
+  serializeVerificationExportPreview,
 } from './verificationFlow'
 import type { ChainProofRecord } from '../stellarTypes'
 import type { ProofEvent } from '../types'
 
-const DIGEST_A = '1'.repeat(64)
-const DIGEST_B = '2'.repeat(64)
-const PROOF_A = `0x${'a'.repeat(64)}`
-const PROOF_UNRELATED = `0x${'e'.repeat(64)}`
+const SAMPLE_HASH = 'a'.repeat(64)
+const SAMPLE_META_HASH = 'b'.repeat(64)
+const SAMPLE_PROOF_ID = 'c'.repeat(64)
 
 function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
   return {
-    videoHash: DIGEST_A,
-    metadataHash: 'm'.repeat(64),
+    videoHash: SAMPLE_HASH,
+    metadataHash: SAMPLE_META_HASH,
     tier: 1,
-    source: 'GSRC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF',
-    issuer: 'GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF',
-    createdAt: '1750000000',
-    expiresAt: 0,
     status: 1,
+    createdAt: '2026-11-19T12:00:00.000Z',
+    expiresAt: 0,
     ...overrides,
   }
 }
 
-describe('resolveVerifiedStatementIdentity', () => {
-  it('resolves active verified statement digest and matching event proofId', () => {
-    const events: ProofEvent[] = [
-      {
-        id: 1,
-        video_hash: DIGEST_B,
-        proof_id: PROOF_UNRELATED,
-        tier: 'seal',
-        tx_hash: 'tx1',
-        created_at: '2026-01-01T00:00:00Z',
-      },
-      {
-        id: 2,
-        video_hash: DIGEST_A,
-        proof_id: PROOF_A,
-        tier: 'source',
-        tx_hash: 'tx2',
-        created_at: '2026-01-01T01:00:00Z',
-      },
-    ]
+function makeEvent(overrides: Partial<ProofEvent> = {}): ProofEvent {
+  return {
+    id: 1,
+    event_type: 'proof_registered',
+    file_name: null,
+    video_hash: SAMPLE_HASH,
+    proof_id: SAMPLE_PROOF_ID,
+    tier: 'source',
+    tx_hash: 'tx123',
+    tx_status: 'confirmed',
+    created_at: '2026-11-19T12:01:00.000Z',
+    ...overrides,
+  }
+}
 
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: DIGEST_A,
-      events,
+describe('verificationFlow export preview', () => {
+  it('builds a complete snapshot with included fields, freshness, and zero unresolved checks for a confirmed online result', () => {
+    const capturedAt = '2026-11-19T12:05:00.000Z'
+    const now = new Date('2026-11-19T12:06:00.000Z')
+
+    const preview = buildVerificationExportPreview({
+      videoHash: SAMPLE_HASH,
+      proofId: SAMPLE_PROOF_ID,
+      metadataHash: SAMPLE_META_HASH,
+      status: 'success',
+      summary: 'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
+      errorCode: null,
+      offline: false,
+      events: [makeEvent()],
       chainProof: makeChainProof(),
+      contractId: 'CDUMMYCONTRACTID',
+      network: 'Test SDF Future Network ; October 2022',
+      capturedAt,
+      now,
     })
 
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.statementKey).toBe(DIGEST_A)
-    expect(result.proofId).toBe(PROOF_A)
-    expect(result.matchingEvents).toHaveLength(1)
-    expect(result.matchingEvents[0].id).toBe(2)
-    expect(result.chainSource).toBe('GSRC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEF')
-    expect(result.metadataHash).toBe('m'.repeat(64))
-  })
-
-  it('never borrows proof ID from an event with a different statement digest', () => {
-    const events: ProofEvent[] = [
-      {
-        id: 1,
-        video_hash: DIGEST_B,
-        proof_id: PROOF_UNRELATED,
-        tier: 'seal',
-        tx_hash: 'tx1',
-        created_at: '2026-01-01T00:00:00Z',
-      },
-    ]
-
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: DIGEST_A,
-      events,
-      chainProof: null,
+    expect(preview.schema).toBe('harpocrates-verification-export-preview')
+    expect(preview.version).toBe(1)
+    expect(preview.trustContextRefreshedOnExport).toBe(false)
+    expect(preview.includedFields).toEqual({
+      videoHash: SAMPLE_HASH,
+      proofId: SAMPLE_PROOF_ID,
+      metadataHash: SAMPLE_META_HASH,
+      mode: 'online',
+      status: 'success',
+      summary: 'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
+      errorCode: null,
+      chainStatus: 'confirmed',
+      tier: 'source',
+      eventCount: 1,
+      contractId: 'CDUMMYCONTRACTID',
+      network: 'Test SDF Future Network ; October 2022',
     })
+    expect(preview.freshness.state).toBe('fresh')
+    expect(preview.freshness.capturedAt).toBe(capturedAt)
+    expect(preview.freshness.chainRecordCreatedAt).toBe('2026-11-19T12:00:00.000Z')
+    expect(preview.freshness.latestEventAt).toBe('2026-11-19T12:01:00.000Z')
+    expect(preview.unresolvedChecks).toEqual([])
 
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.proofId).toBeNull()
-    expect(result.matchingEvents).toHaveLength(0)
+    const serialized = serializeVerificationExportPreview(preview)
+    expect(JSON.parse(serialized)).toEqual(preview)
   })
 
-  it('ignores typed proof ID input if videoHashInput conflicts with verified statement digest', () => {
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: DIGEST_A,
-      videoHashInput: DIGEST_B,
-      proofIdInput: 'stale-typed-proof-id',
+  it('marks freshness as stale once elapsed time exceeds maxAgeMs', () => {
+    const capturedAt = '2026-11-19T12:00:00.000Z'
+    const freshNow = new Date('2026-11-19T12:05:00.000Z')
+    const staleNow = new Date('2026-11-19T12:05:00.001Z')
+
+    expect(evaluateVerificationFreshness(capturedAt, freshNow, 5 * 60 * 1000, false)).toBe('fresh')
+    expect(evaluateVerificationFreshness(capturedAt, staleNow, 5 * 60 * 1000, false)).toBe('stale')
+    expect(evaluateVerificationFreshness(capturedAt, freshNow, 5 * 60 * 1000, true)).toBe('unverified')
+  })
+
+  it('reports unresolved checks for offline mode and missing identifiers', () => {
+    const preview = buildVerificationExportPreview({
+      videoHash: SAMPLE_HASH,
+      status: 'success',
+      summary: 'Locally verified: the artifact carries a valid Harpocrates metadata envelope.',
+      offline: true,
       events: [],
       chainProof: null,
+      network: 'Test SDF Future Network ; October 2022',
+      now: new Date('2026-11-19T12:05:00.000Z'),
     })
 
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.proofId).toBeNull()
+    expect(preview.includedFields.mode).toBe('offline')
+    expect(preview.includedFields.chainStatus).toBe('not_checked')
+    expect(preview.freshness.state).toBe('unverified')
+    expect(preview.unresolvedChecks).toEqual([
+      'On-chain Soroban registry status was not checked (offline mode).',
+      'Backend NeonDB event feed was not queried (offline mode).',
+      'Proof ID could not be resolved.',
+      'Metadata hash could not be resolved.',
+    ])
   })
 
-  it('normalizes 0x prefixes and lowercase hex digests', () => {
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: `0x${DIGEST_A.toUpperCase()}`,
-      proofIdInput: `0X${'F'.repeat(64)}`,
-      events: [],
-      chainProof: null,
+  it('reports revoked chain status and error code as unresolved checks', () => {
+    const preview = buildVerificationExportPreview({
+      videoHash: SAMPLE_HASH,
+      status: 'error',
+      summary: 'Revoked: the chain record for this artifact has been revoked.',
+      errorCode: 'REVOKED_EVIDENCE',
+      offline: false,
+      events: [makeEvent()],
+      chainProof: makeChainProof({ status: 2 }),
+      network: 'Test SDF Future Network ; October 2022',
+      now: new Date('2026-11-19T12:05:00.000Z'),
     })
 
-    expect(result.statementDigest).toBe(DIGEST_A)
-    expect(result.proofId).toBe(`0x${'f'.repeat(64)}`)
+    expect(preview.includedFields.chainStatus).toBe('revoked')
+    expect(preview.unresolvedChecks).toContain('On-chain proof record is revoked.')
+    expect(preview.unresolvedChecks).toContain('Verification ended with error code: REVOKED_EVIDENCE.')
   })
 
-  it('handles empty statement inputs safely without throwing', () => {
-    const result = resolveVerifiedStatementIdentity({
-      verifyHash: '',
-      events: [],
-      chainProof: null,
-    })
+  it('fails closed when verification is idle, in progress, or empty', () => {
+    expect(() =>
+      buildVerificationExportPreview({
+        videoHash: SAMPLE_HASH,
+        status: 'idle',
+        summary: 'No verification run yet.',
+        offline: false,
+        events: [],
+        chainProof: null,
+        network: 'Test SDF Future Network ; October 2022',
+      }),
+    ).toThrow(/idle or in progress/i)
 
-    expect(result.statementDigest).toBe('')
-    expect(result.statementKey).toBe('__empty_statement__')
-    expect(result.proofId).toBeNull()
-    expect(result.metadataHash).toBeNull()
-    expect(result.chainSource).toBeNull()
-    expect(result.matchingEvents).toHaveLength(0)
-  })
-})
+    expect(() =>
+      buildVerificationExportPreview({
+        videoHash: SAMPLE_HASH,
+        status: 'verifying',
+        summary: 'Inspecting evidence…',
+        offline: false,
+        events: [],
+        chainProof: null,
+        network: 'Test SDF Future Network ; October 2022',
+      }),
+    ).toThrow(/idle or in progress/i)
 
-describe('shouldResetDependentTabState', () => {
-  it('returns true when statementKey changes', () => {
-    expect(shouldResetDependentTabState(DIGEST_A, DIGEST_B)).toBe(true)
-    expect(shouldResetDependentTabState('__empty_statement__', DIGEST_A)).toBe(true)
-  })
-
-  it('returns false when statementKey is identical', () => {
-    expect(shouldResetDependentTabState(DIGEST_A, DIGEST_A)).toBe(false)
-    expect(shouldResetDependentTabState('__empty_statement__', '__empty_statement__')).toBe(false)
+    expect(() =>
+      buildVerificationExportPreview({
+        videoHash: '',
+        status: 'success',
+        summary: '',
+        offline: false,
+        events: [],
+        chainProof: null,
+        network: 'Test SDF Future Network ; October 2022',
+      }),
+    ).toThrow(/without a reviewed verification result/i)
   })
 })
