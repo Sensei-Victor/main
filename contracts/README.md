@@ -285,6 +285,8 @@ register_anonymous
 register_anonymous_verified
 register_source
 register_seal
+preflight_statement
+preflight_tier_statement
 revoke_proof
 get_proof
 get_by_video
@@ -442,6 +444,23 @@ Current Testnet verifier:
 ```text
 CCP2EQPKT5XAYTOARX3LGHNMJ37A6W2WY3H54MRIHEZVTVAZZPUSGZQJ
 ```
+
+## Statement Registration Preflight (#1199)
+
+Read-only entry points evaluate canonical public-field framing and active on-chain registry policy without mutating state, consuming caller quotas, or executing cryptographic verification:
+
+- `preflight_statement(env, video_hash, metadata_hash, envelope_version, proof_id, public_inputs, proof_len) -> StatementPreflightResult`
+- `preflight_tier_statement(env, tier, actor, video_hash, metadata_hash, envelope_version, proof_id) -> StatementPreflightResult`
+
+Both methods return a `StatementPreflightResult` struct:
+- `preflight_accepted`: `true` if public-field framing and current policy accept the candidate statement.
+- `cryptographically_verified`: **always `false`**.
+- `proof_stored`: **always `false`**.
+- `requires_crypto_verify`: **always `true`**.
+- `stage`: **always `PreflightStage::StructureAndPolicyOnly`**.
+- `registry_error_code`: non-zero `RegistryError` code when rejected by policy.
+- `codec_reject_code`: non-zero `RejectCode` when rejected by framing/canonicity.
+
 
 ## Receipt Digest Commitment (#337)
 

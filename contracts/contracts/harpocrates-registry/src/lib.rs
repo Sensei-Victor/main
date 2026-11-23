@@ -731,6 +731,45 @@ pub struct BatchRecord {
 
 pub type SourceBatchRecord = BatchRecord;
 
+/// Evaluation stage represented by a [`StatementPreflightResult`].
+///
+/// Preflight evaluates canonical public-field framing and current on-chain
+/// registry policy only; it never runs cryptographic proof verification or
+/// account signature authorization, and never mutates contract storage.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PreflightStage {
+    /// Public field structure and active registry policy evaluated; cryptographic
+    /// proof or signature verification has NOT executed.
+    StructureAndPolicyOnly = 1,
+}
+
+/// Read-only verdict returned by [`HarpocratesRegistry::preflight_statement`]
+/// and [`HarpocratesRegistry::preflight_tier_statement`] (#1199).
+///
+/// Explicitly separates structural/policy preflight acceptance from
+/// cryptographic proof or signature verification:
+/// - `cryptographically_verified` is always `false`
+/// - `proof_stored` is always `false`
+/// - `requires_crypto_verify` is always `true`
+/// - `stage` is always [`PreflightStage::StructureAndPolicyOnly`]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatementPreflightResult {
+    pub preflight_accepted: bool,
+    pub cryptographically_verified: bool,
+    pub proof_stored: bool,
+    pub requires_crypto_verify: bool,
+    pub stage: PreflightStage,
+    pub registry_error_code: u32,
+    pub codec_reject_code: u32,
+    pub tier: u32,
+    pub circuit_version: u32,
+    pub envelope_version: u32,
+}
+
+
 
 /// Versioned on-chain metadata envelope binding (#317).
 ///
@@ -2027,6 +2066,10 @@ pub enum RegistryError {
     ReporterDisputesSaturated = 88,
     /// The action requires admin council threshold approvals.
     InsufficientApprovals = 89,
+    /// Admin and active issuer roles are mutually exclusive for the same address.
+    RoleConflict = 92,
+    /// The key reached `max_registrations` in the current ledger-time window bucket (#806).
+    IssuerQuotaExhausted = 93,
 }
 
 #[contract]
@@ -4419,6 +4462,366 @@ impl HarpocratesRegistry {
         }
         .publish(&env);
         record
+    }
+
+    /// Read-only preflight for Tier 1 (Silent Witness) statement registration (#1199).
+    ///
+    /// Evaluates canonical public-field framing and current on-chain registry policy
+    /// without storing a proof, invoking an external verifier, requiring authorization,
+    /// or mutating storage.
+    ///
+    /// Separation of concerns:
+    /// - `preflight_accepted == true` means public field structure and active
+    ///   on-chain policy accept the candidate statement at the current ledger.
+    /// - `cryptographically_verified` is **always `false`**, `proof_stored` is
+    ///   **always `false`**, `requires_crypto_verify` is **always `true`**, and
+    ///   `stage` is [`PreflightStage::StructureAndPolicyOnly`], so callers can
+    ///   never confuse preflight acceptance with cryptographic proof verification
+    ///   or persistent registration.
+    pub fn preflight_statement(
+        env: Env,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        envelope_version: u32,
+        proof_id: BytesN<32>,
+        public_inputs: Bytes,
+        proof_len: u32,
+    ) -> StatementPreflightResult {
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::NotInitialized as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if domain_is_paused(
+            &env,
+            PAUSE_DOMAIN_TIER1_REGISTRATION,
+            env.ledger().timestamp(),
+        ) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::Paused as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_envelope(&env, envelope_version, &metadata_hash) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_unique(&env, &proof_id, &video_hash) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let input_len = public_inputs.len();
+        if input_len == SILENT_WITNESS_V2_BARE_INPUT_LEN {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::CircuitVersionMismatch as u32,
+                verifier_inputs::RejectCode::Length.as_code(),
+            );
+        }
+
+        let expected_domain = expected_domain_tag(&env).to_array();
+        let mut raw_inputs = [0u8; 512];
+        if input_len as usize > raw_inputs.len() {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                0,
+                envelope_version,
+                RegistryError::InvalidPublicInputs as u32,
+                verifier_inputs::RejectCode::Length.as_code(),
+            );
+        }
+        let input_len_usize = input_len as usize;
+        public_inputs.copy_into_slice(&mut raw_inputs[..input_len_usize]);
+        let input_slice = &raw_inputs[..input_len_usize];
+
+        let (parsed_video_hash, parsed_cred_root, parsed_nullifier, circuit_version) =
+            if input_len == verifier_inputs::SILENT_WITNESS_BROWSER_PUBLIC_INPUTS_LEN as u32 {
+                match verifier_inputs::parse_browser_silent_witness(input_slice) {
+                    Ok(parsed) => (
+                        parsed.video_hash,
+                        parsed.credential_root,
+                        parsed.nullifier,
+                        parsed.circuit_version,
+                    ),
+                    Err(code) => {
+                        return preflight_reject(
+                            TIER_SILENT_WITNESS,
+                            1,
+                            envelope_version,
+                            map_codec_reject_to_registry_error(code) as u32,
+                            code.as_code(),
+                        );
+                    }
+                }
+            } else if input_len == verifier_inputs::SILENT_WITNESS_V2_PUBLIC_INPUTS_LEN as u32 {
+                match verifier_inputs::parse_silent_witness_v2(input_slice, &expected_domain) {
+                    Ok(parsed) => {
+                        let parsed_scope = BytesN::from_array(&env, &parsed.verifier_scope);
+                        let epoch_val = bytes_to_u64_be(&parsed.epoch);
+                        let current_epoch = get_scope_epoch_raw(&env, &parsed_scope);
+                        if epoch_val != current_epoch {
+                            return preflight_reject(
+                                TIER_SILENT_WITNESS,
+                                parsed.circuit_version,
+                                envelope_version,
+                                RegistryError::StaleEpoch as u32,
+                                verifier_inputs::ACCEPTED_CODE,
+                            );
+                        }
+                        (
+                            parsed.video_hash,
+                            parsed.credential_root,
+                            parsed.nullifier,
+                            parsed.circuit_version,
+                        )
+                    }
+                    Err(code) => {
+                        return preflight_reject(
+                            TIER_SILENT_WITNESS,
+                            2,
+                            envelope_version,
+                            map_codec_reject_to_registry_error(code) as u32,
+                            code.as_code(),
+                        );
+                    }
+                }
+            } else if input_len == verifier_inputs::SILENT_WITNESS_PUBLIC_INPUTS_LEN as u32 {
+                match verifier_inputs::parse_silent_witness(input_slice, &expected_domain) {
+                    Ok(parsed) => (
+                        parsed.video_hash,
+                        parsed.credential_root,
+                        parsed.nullifier,
+                        parsed.circuit_version,
+                    ),
+                    Err(code) => {
+                        return preflight_reject(
+                            TIER_SILENT_WITNESS,
+                            1,
+                            envelope_version,
+                            map_codec_reject_to_registry_error(code) as u32,
+                            code.as_code(),
+                        );
+                    }
+                }
+            } else {
+                return preflight_reject(
+                    TIER_SILENT_WITNESS,
+                    0,
+                    envelope_version,
+                    RegistryError::InvalidPublicInputs as u32,
+                    verifier_inputs::RejectCode::Length.as_code(),
+                );
+            };
+
+        let parsed_video = BytesN::from_array(&env, &parsed_video_hash);
+        if parsed_video != video_hash {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::InvalidPublicInputs as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let parsed_root = BytesN::from_array(&env, &parsed_cred_root);
+        if let Err(err) = check_active_credential_root(&env, &parsed_root) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let verifier_ctx = VerifierContext::load(&env);
+        let Some(_verifier) = verifier_ctx.verifier.as_ref() else {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::VerifierNotSet as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        };
+
+        if let Err(err) = check_supported_circuit_version(&verifier_ctx, circuit_version) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let parsed_null = BytesN::from_array(&env, &parsed_nullifier);
+        if verifier_ctx.has_nullifier(&env, &parsed_null) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::DuplicateNullifier as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(code) = verifier_inputs::check_proof_bounds(proof_len) {
+            return preflight_reject(
+                TIER_SILENT_WITNESS,
+                circuit_version,
+                envelope_version,
+                RegistryError::InvalidProof as u32,
+                code.as_code(),
+            );
+        }
+
+        preflight_accept(TIER_SILENT_WITNESS, circuit_version, envelope_version)
+    }
+
+    /// Read-only preflight for a Tier 2 (Consistent Source) or Tier 3 (Public
+    /// Seal) statement registration (#1199).
+    ///
+    /// Validates tier selection (`2` or `3`), initialization, per-tier pause
+    /// domains, metadata envelope version, role conflict, statement uniqueness,
+    /// issuer standing, and caller quota availability without requiring account
+    /// signature authorization, storing proof records, or mutating quota counters.
+    ///
+    /// Separation of concerns: `cryptographically_verified` and `proof_stored`
+    /// are always `false` and `requires_crypto_verify` is always `true` because
+    /// account signature authorization (`require_auth`) is enforced only on the
+    /// actual `register_source` / `register_seal` write transaction.
+    pub fn preflight_tier_statement(
+        env: Env,
+        tier: u32,
+        actor: Address,
+        video_hash: BytesN<32>,
+        metadata_hash: BytesN<32>,
+        envelope_version: u32,
+        proof_id: BytesN<32>,
+    ) -> StatementPreflightResult {
+        if tier != TIER_CONSISTENT_SOURCE && tier != TIER_PUBLIC_SEAL {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::InvalidPublicInputs as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        let Some(admin) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+        else {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::NotInitialized as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        };
+
+        let pause_domain = if tier == TIER_CONSISTENT_SOURCE {
+            PAUSE_DOMAIN_TIER2_REGISTRATION
+        } else {
+            PAUSE_DOMAIN_TIER3_REGISTRATION
+        };
+        if domain_is_paused(&env, pause_domain, env.ledger().timestamp()) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::Paused as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_envelope(&env, envelope_version, &metadata_hash) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if tier == TIER_PUBLIC_SEAL && actor == admin {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                RegistryError::RoleConflict as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if let Err(err) = check_preflight_unique(&env, &proof_id, &video_hash) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        if tier == TIER_PUBLIC_SEAL {
+            let active_issuer = env
+                .storage()
+                .persistent()
+                .get::<DataKey, IssuerRecord>(&DataKey::Issuer(actor.clone()))
+                .map(|r| r.active)
+                .unwrap_or(false);
+            if !active_issuer {
+                return preflight_reject(
+                    tier,
+                    0,
+                    envelope_version,
+                    RegistryError::UnknownIssuer as u32,
+                    verifier_inputs::ACCEPTED_CODE,
+                );
+            }
+        }
+
+        if let Err(err) = check_issuer_quota_available(&env, &actor) {
+            return preflight_reject(
+                tier,
+                0,
+                envelope_version,
+                err as u32,
+                verifier_inputs::ACCEPTED_CODE,
+            );
+        }
+
+        preflight_accept(tier, 0, envelope_version)
     }
 
     fn revoke_proof_internal(
@@ -8090,6 +8493,159 @@ fn u32_from_be_bytes(bytes: &[u8; 32]) -> u32 {
     u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]])
 }
 
+fn preflight_accept(
+    tier: u32,
+    circuit_version: u32,
+    envelope_version: u32,
+) -> StatementPreflightResult {
+    StatementPreflightResult {
+        preflight_accepted: true,
+        cryptographically_verified: false,
+        proof_stored: false,
+        requires_crypto_verify: true,
+        stage: PreflightStage::StructureAndPolicyOnly,
+        registry_error_code: 0,
+        codec_reject_code: verifier_inputs::ACCEPTED_CODE,
+        tier,
+        circuit_version,
+        envelope_version,
+    }
+}
+
+fn preflight_reject(
+    tier: u32,
+    circuit_version: u32,
+    envelope_version: u32,
+    registry_error_code: u32,
+    codec_reject_code: u32,
+) -> StatementPreflightResult {
+    StatementPreflightResult {
+        preflight_accepted: false,
+        cryptographically_verified: false,
+        proof_stored: false,
+        requires_crypto_verify: true,
+        stage: PreflightStage::StructureAndPolicyOnly,
+        registry_error_code,
+        codec_reject_code,
+        tier,
+        circuit_version,
+        envelope_version,
+    }
+}
+
+fn map_codec_reject_to_registry_error(code: verifier_inputs::RejectCode) -> RegistryError {
+    match code {
+        verifier_inputs::RejectCode::MalformedHex | verifier_inputs::RejectCode::Length => {
+            RegistryError::InvalidPublicInputs
+        }
+        verifier_inputs::RejectCode::Padding
+        | verifier_inputs::RejectCode::NonCanonicalField
+        | verifier_inputs::RejectCode::ZeroField
+        | verifier_inputs::RejectCode::UnknownSchema => RegistryError::InvalidPublicInputs,
+        verifier_inputs::RejectCode::DomainMismatch => RegistryError::DomainTagMismatch,
+        verifier_inputs::RejectCode::VersionMismatch => RegistryError::CircuitVersionMismatch,
+        verifier_inputs::RejectCode::ProofUndersize | verifier_inputs::RejectCode::ProofOversize => {
+            RegistryError::InvalidProof
+        }
+    }
+}
+
+fn check_preflight_envelope(
+    env: &Env,
+    version: u32,
+    metadata_hash: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    if version < METADATA_ENVELOPE_V1 || version > METADATA_ENVELOPE_VERSION_MAX {
+        return Err(RegistryError::UnsupportedMetadataEnvelopeVersion);
+    }
+    let zero = BytesN::from_array(env, &[0u8; 32]);
+    if version > METADATA_ENVELOPE_V1 && *metadata_hash == zero {
+        return Err(RegistryError::InvalidMetadataEnvelope);
+    }
+    Ok(())
+}
+
+fn check_preflight_unique(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    video_hash: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::Proof(proof_id.clone()))
+    {
+        return Err(RegistryError::DuplicateProof);
+    }
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::Video(video_hash.clone()))
+    {
+        return Err(RegistryError::DuplicateVideo);
+    }
+    Ok(())
+}
+
+fn check_active_credential_root(
+    env: &Env,
+    credential_root: &BytesN<32>,
+) -> Result<(), RegistryError> {
+    let Some(record) = get_credential_root_record_opt(env, credential_root) else {
+        return Err(RegistryError::UnknownCredentialRoot);
+    };
+    if record.status == STATUS_REVOKED {
+        return Err(RegistryError::RevokedCredentialRoot);
+    }
+    if record.status == STATUS_EXPIRED
+        || (record.expires_at > 0 && env.ledger().timestamp() >= record.expires_at)
+    {
+        return Err(RegistryError::ExpiredCredentialRoot);
+    }
+    Ok(())
+}
+
+fn check_issuer_quota_available(env: &Env, subject: &Address) -> Result<(), RegistryError> {
+    let quota_key = DataKey::IssuerQuota(subject.clone());
+    let quota: Option<IssuerQuotaRecord> = env.storage().persistent().get(&quota_key);
+    let Some(quota) = quota else {
+        return Ok(());
+    };
+    if quota.max_registrations == 0 || quota.window_secs == 0 {
+        return Ok(());
+    }
+
+    let bucket = issuer_quota_bucket(env, quota.window_secs);
+    let usage_key = DataKey::IssuerQuotaUsage(subject.clone());
+    let stored: Option<IssuerQuotaUsage> = env.storage().persistent().get(&usage_key);
+    let usage = match stored {
+        Some(usage) if usage.bucket == bucket => usage,
+        _ => IssuerQuotaUsage { bucket, count: 0 },
+    };
+
+    if usage.count >= quota.max_registrations {
+        return Err(RegistryError::IssuerQuotaExhausted);
+    }
+
+    Ok(())
+}
+
+fn check_supported_circuit_version(
+    ctx: &VerifierContext,
+    circuit_version: u32,
+) -> Result<(), RegistryError> {
+    if circuit_version < MIN_SUPPORTED_CIRCUIT_VERSION
+        || circuit_version > MAX_SUPPORTED_CIRCUIT_VERSION
+    {
+        return Err(RegistryError::UnsupportedCircuitVersion);
+    }
+    let (min_v, max_v) = ctx.circuit_versions;
+    if circuit_version < min_v || circuit_version > max_v {
+        return Err(RegistryError::UnsupportedCircuitVersion);
+    }
+    Ok(())
+}
+
 /// Test-only helpers for reading contract events.
 ///
 /// `env.events().all()` only reflects the most recent invocation, so callers
@@ -8213,4 +8769,6 @@ mod test_ttl;
 mod test_list_credential_roots;
 #[cfg(test)]
 mod test_uninitialized;
+#[cfg(test)]
+mod test_preflight;
 
