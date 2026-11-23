@@ -80,6 +80,22 @@ export {
 export type { LineageNode, LineageTreeResult, LineageFetcher } from './verify-lineage.js'
 export { resolveNetwork, DEFAULT_NETWORK_PASSPHRASE } from './network.js'
 export {
+  parseTrustPolicy,
+  compareTrustPolicies,
+  formatTrustPolicyComparison,
+  runCompareTrustPolicy,
+  PolicyParseError,
+} from './compare-trust-policy.js'
+export type {
+  TrustPolicy,
+  ReceiptDecision,
+  ReceiptDiff,
+  ManifestDecision,
+  ManifestDiff,
+  TrustPolicyComparisonReport,
+  RunCompareTrustPolicyIo,
+} from './compare-trust-policy.js'
+export {
   checkCompatibility,
   formatCompatReport,
   runCheckCompat,

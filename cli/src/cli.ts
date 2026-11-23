@@ -33,6 +33,7 @@ import {
 } from './c2pa.js'
 import { verifyLineageTree, formatLineageTree } from './verify-lineage.js'
 import { parseOfflineBundle, verifyOfflineBundle, formatOfflineBundleReport } from './verify-bundle.js'
+import { runCompareTrustPolicy } from './compare-trust-policy.js'
 import { logStructured, redactSensitive } from './logging.js'
 import { createRequire } from 'node:module'
 import { parseCliArgs, CliUsageError, type ParsedArgs } from './args.js'
@@ -242,6 +243,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       return await handleVerifyLineage(flags, debugLog)
     case 'verify-bundle':
       return await handleVerifyBundle(flags, debugLog)
+    case 'compare-trust-policy':
+      return await handleCompareTrustPolicy(flags, debugLog)
     case 'register':
       return await handleRegister(flags, debugLog)
     case 'help':
@@ -663,6 +666,19 @@ async function handleVerifyBundle(
   exit(report.summary.allValid ? 0 : 8)
 }
 
+async function handleCompareTrustPolicy(
+  flags: Record<string, string>,
+  debugLog: (event: Record<string, unknown>) => void,
+): Promise<void> {
+  const code = await runCompareTrustPolicy(flags, {
+    readText,
+    writeStdout: (text) => process.stdout.write(text),
+    writeStderr: (text) => process.stderr.write(text),
+    debugLog,
+  })
+  exit(code)
+}
+
 export function formatProofStatus(info: {
   proofId: string
   contractId: string
@@ -774,6 +790,8 @@ Commands:
   verify-receipt Verify an offline signed receipt.
   verify-bundle  Verify receipts, manifests and a trust snapshot from a local
                  bundle offline; online-only checks are reported as unavailable.
+  compare-trust-policy  Evaluate two trust-policy files against identical bundle
+                 evidence and show which trust decisions changed between them.
   c2pa           Export C2PA authenticity assertions from a proof manifest.
   version        Print the CLI version.
   help           Show this help message.
@@ -864,6 +882,15 @@ Verify-bundle options:
   --output, -o      Output format: "text" (default) or "json".
   Validates manifests and receipts offline; on-chain checks (proof status,
   transaction confirmation, lineage) are reported as unavailable.
+
+Compare-trust-policy options:
+  --policy-a        Path to the first trust-policy JSON file (required).
+  --policy-b        Path to the second trust-policy JSON file (required).
+  --bundle, -b      Path to the saved verification bundle JSON (required).
+  --output, -o      Output format: "text" (default) or "json".
+  Evaluates both policies against the same bundle evidence without altering
+  either policy. Exit 0 means no decisions changed; exit 1 means at least
+  one receipt decision differs between the two policies.
 
 Environment variables:
   HARPOCRATES_SOURCE_ADDRESS   Source address for Stellar simulation.

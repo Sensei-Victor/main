@@ -10,6 +10,7 @@ export type Command =
   | 'c2pa'
   | 'verify-lineage'
   | 'verify-bundle'
+  | 'compare-trust-policy'
   | 'help'
 
 export interface ParsedArgs {
@@ -127,6 +128,15 @@ const COMMAND_OPTIONS: Record<Exclude<Command, 'help'>, OptionSet> = {
     output: alias('o'),
     debug: toggle,
   },
+  'compare-trust-policy': {
+    'policy-a': text,
+    policyA: text,
+    'policy-b': text,
+    policyB: text,
+    bundle: alias('b'),
+    output: alias('o'),
+    debug: toggle,
+  },
 }
 
 // Environment variable defaults for flags that are otherwise required on every call.
@@ -157,6 +167,10 @@ const ENV_DEFAULTS: Partial<Record<Exclude<Command, 'help'>, { keys: string[]; e
     env: '',
   },
   'verify-bundle': {
+    keys: [],
+    env: '',
+  },
+  'compare-trust-policy': {
     keys: [],
     env: '',
   },
